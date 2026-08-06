@@ -1,6 +1,7 @@
 use crate::transaction::sync_client::safe_block_on;
 use crate::{
-    transaction::Mutation, BoundRange, Key, KvPair, Result, Timestamp, Transaction, Value,
+    transaction::Mutation, BoundRange, DiskFullOpt, Key, KvPair, Result, Timestamp, Transaction,
+    Value,
 };
 use std::sync::Arc;
 
@@ -16,6 +17,11 @@ pub struct SyncTransaction {
 impl SyncTransaction {
     pub(crate) fn new(inner: Transaction, runtime: Arc<tokio::runtime::Runtime>) -> Self {
         Self { inner, runtime }
+    }
+
+    /// Sets whether writes may proceed at each TiKV disk usage level.
+    pub fn set_disk_full_opt(&mut self, option: DiskFullOpt) {
+        self.inner.set_disk_full_opt(option);
     }
 
     /// Get the value associated with the given key.

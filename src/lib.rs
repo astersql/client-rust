@@ -144,6 +144,8 @@ pub use crate::kv::KvPair;
 #[doc(inline)]
 pub use crate::kv::Value;
 #[doc(inline)]
+pub use crate::proto::kvrpcpb::DiskFullOpt;
+#[doc(inline)]
 pub use crate::raw::lowering as raw_lowering;
 #[doc(inline)]
 pub use crate::raw::Client as RawClient;

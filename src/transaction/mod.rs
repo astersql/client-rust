@@ -32,6 +32,8 @@ pub(crate) use lock::reject_shared_locks;
 pub use lock::LockResolver;
 pub use lock::ResolveLocksContext;
 pub use lock::ResolveLocksOptions;
+#[cfg(test)]
+mod disk_full_opt_test;
 mod snapshot;
 mod sync_client;
 mod sync_snapshot;

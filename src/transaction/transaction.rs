@@ -17,6 +17,7 @@ use crate::backoff::DEFAULT_REGION_BACKOFF;
 use crate::pd::PdClient;
 use crate::pd::PdRpcClient;
 use crate::proto::kvrpcpb;
+use crate::proto::kvrpcpb::DiskFullOpt;
 use crate::proto::pdpb::Timestamp;
 use crate::request::Collect;
 use crate::request::CollectError;
@@ -117,6 +118,14 @@ impl<PdC: PdClient> Transaction<PdC> {
             prewritten: false,
             start_instant: std::time::Instant::now(),
         }
+    }
+
+    /// Sets whether writes may proceed at each TiKV disk usage level.
+    ///
+    /// The option is attached to prewrite and commit requests, matching
+    /// client-go's `KVTxn.SetDiskFullOpt`.
+    pub fn set_disk_full_opt(&mut self, option: DiskFullOpt) {
+        self.options.disk_full_opt = option;
     }
 
     /// Create a new 'get' request
@@ -1155,6 +1164,8 @@ pub struct TransactionOptions {
     retry_options: RetryOptions,
     /// What to do if the transaction is dropped without an attempt to commit or rollback
     check_level: CheckLevel,
+    /// Whether writes may proceed at each TiKV disk usage level.
+    disk_full_opt: DiskFullOpt,
     #[doc(hidden)]
     heartbeat_option: HeartbeatOption,
 }
@@ -1181,6 +1192,7 @@ impl TransactionOptions {
             read_only: false,
             retry_options: RetryOptions::default_optimistic(),
             check_level: CheckLevel::Panic,
+            disk_full_opt: DiskFullOpt::NotAllowedOnFull,
             heartbeat_option: HeartbeatOption::FixedTime(DEFAULT_HEARTBEAT_INTERVAL),
         }
     }
@@ -1194,6 +1206,7 @@ impl TransactionOptions {
             read_only: false,
             retry_options: RetryOptions::default_pessimistic(),
             check_level: CheckLevel::Panic,
+            disk_full_opt: DiskFullOpt::NotAllowedOnFull,
             heartbeat_option: HeartbeatOption::FixedTime(DEFAULT_HEARTBEAT_INTERVAL),
         }
     }
@@ -1401,6 +1414,10 @@ impl<PdC: PdClient> Committer<PdC> {
             ),
         };
 
+        request
+            .context
+            .get_or_insert_with(kvrpcpb::Context::default)
+            .disk_full_opt = self.options.disk_full_opt as i32;
         request.use_async_commit = self.options.async_commit;
         request.try_one_pc = self.options.try_one_pc;
         request.secondaries = self
@@ -1453,11 +1470,14 @@ impl<PdC: PdClient> Committer<PdC> {
         );
         let primary_key = self.primary_key.clone().into_iter();
         let commit_version = self.rpc.clone().get_timestamp().await?;
-        let req = new_commit_request(
+        let mut req = new_commit_request(
             primary_key,
             self.start_version.clone(),
             commit_version.clone(),
         );
+        req.context
+            .get_or_insert_with(kvrpcpb::Context::default)
+            .disk_full_opt = self.options.disk_full_opt as i32;
         let plan = PlanBuilder::new(self.rpc.clone(), self.keyspace, req)
             .resolve_lock(
                 self.start_version.clone(),
@@ -1567,7 +1587,7 @@ impl<PdC: PdClient> Committer<PdC> {
             fp()?
         });
 
-        let req = if self.options.async_commit {
+        let mut req = if self.options.async_commit {
             let keys = mutations.map(|m| m.key.into());
             new_commit_request(keys, start_version.clone(), commit_version)
         } else if primary_only {
@@ -1579,6 +1599,9 @@ impl<PdC: PdClient> Committer<PdC> {
                 .filter(|key| &primary_key != key);
             new_commit_request(keys, start_version.clone(), commit_version)
         };
+        req.context
+            .get_or_insert_with(kvrpcpb::Context::default)
+            .disk_full_opt = self.options.disk_full_opt as i32;
         let plan = PlanBuilder::new(self.rpc, self.keyspace, req)
             .resolve_lock(
                 start_version,
