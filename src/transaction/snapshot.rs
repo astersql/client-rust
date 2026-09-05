@@ -1,3 +1,4 @@
+// Copyright 2026 AsterSQL.
 // Copyright 2019 TiKV Project Authors. Licensed under Apache-2.0.
 
 use derive_new::new;
@@ -24,6 +25,10 @@ pub struct Snapshot {
 }
 
 impl Snapshot {
+    pub fn set_read_options(&mut self, options: Option<crate::ReadOptions>) {
+        self.transaction.set_read_options(options);
+    }
+
     /// Get the value associated with the given key.
     pub async fn get(&mut self, key: impl Into<Key>) -> Result<Option<Value>> {
         trace!("invoking get request on snapshot");

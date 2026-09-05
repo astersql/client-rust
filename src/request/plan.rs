@@ -1,3 +1,4 @@
+// Copyright 2026 AsterSQL.
 // Copyright 2021 TiKV Project Authors. Licensed under Apache-2.0.
 
 use std::marker::PhantomData;
@@ -53,6 +54,15 @@ pub trait Plan: Sized + Clone + Sync + Send + 'static {
 
     /// Execute the plan.
     async fn execute(&self) -> Result<Self::Result>;
+    fn read_options(&self) -> Option<crate::ReadOptions> {
+        None
+    }
+    fn configure_read_attempt(
+        &mut self,
+        _timeout: Option<std::time::Duration>,
+        _replica_read: bool,
+    ) {
+    }
 }
 
 /// The simplest plan which just dispatches a request to a specific kv server.
@@ -60,20 +70,47 @@ pub trait Plan: Sized + Clone + Sync + Send + 'static {
 pub struct Dispatch<Req: KvRequest> {
     pub request: Req,
     pub kv_client: Option<Arc<dyn KvClient + Send + Sync>>,
+    pub read_options: Option<crate::ReadOptions>,
 }
 
 #[async_trait]
 impl<Req: KvRequest> Plan for Dispatch<Req> {
     type Result = Req::Response;
+    fn read_options(&self) -> Option<crate::ReadOptions> {
+        self.read_options.clone()
+    }
+    fn configure_read_attempt(&mut self, timeout: Option<std::time::Duration>, replica_read: bool) {
+        if let Some(options) = &mut self.read_options {
+            options.timeout = timeout.unwrap_or_default();
+        }
+        self.request.set_replica_read(replica_read);
+    }
 
     async fn execute(&self) -> Result<Self::Result> {
+        let started = std::time::Instant::now();
+        let timeout = self
+            .read_options
+            .as_ref()
+            .map(|o| o.timeout)
+            .filter(|t| !t.is_zero());
         let stats = tikv_stats(self.request.label());
         let result = self
             .kv_client
             .as_ref()
             .expect("Unreachable: kv_client has not been initialised in Dispatch")
-            .dispatch(&self.request)
+            .dispatch_with_timeout(&self.request, timeout)
             .await;
+        if let Some(options) = &self.read_options {
+            options.stats.record(
+                self.request.label(),
+                self.request.as_any(),
+                started.elapsed(),
+                result
+                    .as_ref()
+                    .err()
+                    .is_some_and(crate::read_options::is_read_timeout),
+            );
+        }
         let result = stats.done(result);
         result.map(|r| {
             *r.downcast()
@@ -444,6 +481,7 @@ where
         original_leader_store_id: Option<StoreId>,
         permits: &Semaphore,
         terminal_on_dispatch_error: bool,
+        use_read_timeout: bool,
     ) -> CandidateRoundResult<P::Result> {
         let is_fallback = original_leader_store_id != Some(peer.store_id);
         let mut candidate_region = region.clone();
@@ -473,6 +511,14 @@ where
             // repair an invalid request.
             return CandidateRoundResult::OtherError(error);
         }
+        let timeout = if use_read_timeout {
+            plan.read_options()
+                .filter(|options| !options.timeout.is_zero())
+                .map(|options| options.timeout)
+        } else {
+            None
+        };
+        plan.configure_read_attempt(timeout, timeout.is_some() && is_fallback);
 
         // Fallback attempts are sequential inside one shard, so at most one
         // concurrency permit is held at a time.
@@ -486,6 +532,12 @@ where
                 region_store,
                 is_fallback,
             ))),
+            Err(error) if crate::read_options::is_read_timeout(&error) && timeout.is_some() => {
+                CandidateRoundResult::RoutingError {
+                    error,
+                    invalidate_region: false,
+                }
+            }
             Err(error) if is_grpc_error(&error) => {
                 debug!(
                     "single_shard_handler:execute: grpc error, fallback: {}, error: {:?}",
@@ -535,6 +587,8 @@ where
         let mut invalidate_region = false;
         let mut saw_fallback_not_leader = false;
         let mut last_server_busy_response = None;
+        let mut saw_read_timeout = false;
+        let mut saw_non_timeout_failure = false;
 
         for peer in region_request_candidates(region, followers_only) {
             match Self::execute_candidate(
@@ -545,10 +599,12 @@ where
                 original_leader_store_id,
                 permits,
                 terminal_on_dispatch_error,
+                true,
             )
             .await
             {
                 CandidateRoundResult::MapRegionToStoreError(error) => {
+                    saw_non_timeout_failure = true;
                     // Mapping includes Store lookup and opening a TiKV channel.
                     // One unavailable candidate must not hide a later healthy
                     // voter, especially while waking a cold Region.
@@ -558,6 +614,11 @@ where
                     error,
                     invalidate_region: candidate_invalidates_region,
                 } => {
+                    if crate::read_options::is_read_timeout(&error) {
+                        saw_read_timeout = true;
+                    } else {
+                        saw_non_timeout_failure = true;
+                    }
                     // Preserve the fact that at least one mapped candidate had
                     // a transport routing failure. A later mapping failure must
                     // not hide the need to reload an exhausted Region route.
@@ -565,6 +626,7 @@ where
                     last_routing_error = Some(error);
                 }
                 CandidateRoundResult::Response(response) if response.is_fallback_not_leader() => {
+                    saw_non_timeout_failure = true;
                     // A follower hint is unnecessary for the three-replica
                     // cold-region path: keep walking the Region's voters. A
                     // real new leader will accept its normal (non-replica-read)
@@ -572,6 +634,7 @@ where
                     saw_fallback_not_leader = true;
                 }
                 CandidateRoundResult::Response(response) if response.is_fallback_server_busy() => {
+                    saw_non_timeout_failure = true;
                     // A follower probe can itself be rejected at the read-pool
                     // entrance. Keep trying other voters before restoring the
                     // cached leader.
@@ -581,6 +644,22 @@ where
                     return CandidateRoundResult::OtherError(error);
                 }
                 response @ CandidateRoundResult::Response(_) => return response,
+            }
+        }
+
+        if saw_read_timeout && !saw_non_timeout_failure && !followers_only {
+            if let Some(leader) = region.leader.as_ref() {
+                return Self::execute_candidate(
+                    pd_client,
+                    plan,
+                    region,
+                    leader,
+                    original_leader_store_id,
+                    permits,
+                    terminal_on_dispatch_error,
+                    false,
+                )
+                .await;
             }
         }
 
@@ -1256,6 +1335,13 @@ where
     P::Result: HasLocks,
 {
     type Result = P::Result;
+
+    fn read_options(&self) -> Option<crate::ReadOptions> {
+        self.inner.read_options()
+    }
+    fn configure_read_attempt(&mut self, timeout: Option<std::time::Duration>, replica_read: bool) {
+        self.inner.configure_read_attempt(timeout, replica_read);
+    }
 
     async fn execute(&self) -> Result<Self::Result> {
         let mut result = self.inner.execute().await?;

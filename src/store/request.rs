@@ -1,3 +1,4 @@
+// Copyright 2026 AsterSQL.
 // Copyright 2020 TiKV Project Authors. Licensed under Apache-2.0.
 
 use std::any::Any;
@@ -24,6 +25,7 @@ pub trait Request: Any + Sync + Send + 'static {
     fn as_any(&self) -> &dyn Any;
     fn set_leader(&mut self, leader: &RegionWithLeader) -> Result<()>;
     fn set_api_version(&mut self, api_version: kvrpcpb::ApiVersion);
+    fn set_replica_read(&mut self, _enabled: bool) {}
 }
 
 macro_rules! impl_request {
@@ -62,6 +64,12 @@ macro_rules! impl_request {
                 ctx.region_epoch = leader.region.region_epoch.clone();
                 ctx.peer = Some(leader_peer.clone());
                 Ok(())
+            }
+
+            fn set_replica_read(&mut self, enabled: bool) {
+                self.context
+                    .get_or_insert(kvrpcpb::Context::default())
+                    .replica_read = enabled;
             }
 
             fn set_api_version(&mut self, api_version: kvrpcpb::ApiVersion) {
@@ -120,4 +128,10 @@ impl_request!(
     UnsafeDestroyRangeRequest,
     unsafe_destroy_range,
     "unsafe_destroy_range"
+);
+
+impl_request!(
+    GetLockWaitInfoRequest,
+    get_lock_wait_info,
+    "get_lock_wait_info"
 );

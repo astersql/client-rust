@@ -1,3 +1,4 @@
+// Copyright 2026 AsterSQL.
 // Copyright 2018 TiKV Project Authors. Licensed under Apache-2.0.
 
 //! This crate provides an easy-to-use client for [TiKV](https://github.com/tikv/tikv), a
@@ -105,9 +106,10 @@ mod compat;
 mod config;
 mod kv;
 mod pd;
-mod proto;
+pub mod proto;
 mod region;
 mod region_cache;
+pub mod rpc_interceptor;
 mod stats;
 mod store;
 mod timestamp;
@@ -179,3 +181,9 @@ pub use crate::transaction::SyncTransactionClient;
 pub use crate::transaction::Transaction;
 #[doc(inline)]
 pub use crate::transaction::TransactionOptions;
+
+pub mod read_options;
+pub use read_options::{ReadAttempt, ReadOptions, ReadStats};
+
+#[cfg(test)]
+mod read_options_test;

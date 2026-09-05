@@ -1,3 +1,4 @@
+// Copyright 2026 AsterSQL.
 // Copyright 2021 TiKV Project Authors. Licensed under Apache-2.0.
 
 use std::marker::PhantomData;
@@ -48,6 +49,11 @@ pub struct Targetted;
 impl PlanBuilderPhase for Targetted {}
 
 impl<PdC: PdClient, Req: KvRequest> PlanBuilder<PdC, Dispatch<Req>, NoTarget> {
+    pub fn with_read_options(mut self, options: Option<crate::ReadOptions>) -> Self {
+        self.plan.read_options = options;
+        self
+    }
+
     pub fn new(pd_client: Arc<PdC>, keyspace: Keyspace, mut request: Req) -> Self {
         request.set_api_version(keyspace.api_version());
         PlanBuilder {
@@ -55,6 +61,7 @@ impl<PdC: PdClient, Req: KvRequest> PlanBuilder<PdC, Dispatch<Req>, NoTarget> {
             plan: Dispatch {
                 request,
                 kv_client: None,
+                read_options: None,
             },
             phantom: PhantomData,
         }

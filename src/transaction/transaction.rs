@@ -1,3 +1,4 @@
+// Copyright 2026 AsterSQL.
 // Copyright 2019 TiKV Project Authors. Licensed under Apache-2.0.
 
 use std::iter;
@@ -99,6 +100,10 @@ pub struct Transaction<PdC: PdClient = PdRpcClient> {
 }
 
 impl<PdC: PdClient> Transaction<PdC> {
+    pub fn set_read_options(&mut self, options: Option<crate::ReadOptions>) {
+        self.options.read_options = options;
+    }
+
     pub(crate) fn new(
         timestamp: Timestamp,
         rpc: Arc<PdC>,
@@ -121,6 +126,22 @@ impl<PdC: PdClient> Transaction<PdC> {
             prewritten: false,
             start_instant: std::time::Instant::now(),
         }
+    }
+
+    /// Apply TiDB transaction options before staging mutations.
+    pub fn set_async_commit(&mut self, enabled: bool) {
+        self.options.async_commit = enabled;
+    }
+    pub fn set_one_pc(&mut self, enabled: bool) {
+        self.options.try_one_pc = enabled;
+    }
+    pub fn set_pessimistic(&mut self, enabled: bool) {
+        self.options.kind = if enabled {
+            TransactionKind::Pessimistic(self.timestamp.clone())
+        } else {
+            TransactionKind::Optimistic
+        };
+        self.buffer.set_pessimistic(enabled);
     }
 
     /// Sets whether writes may proceed at each TiKV disk usage level.
@@ -152,6 +173,7 @@ impl<PdC: PdClient> Transaction<PdC> {
     pub async fn get(&mut self, key: impl Into<Key>) -> Result<Option<Value>> {
         trace!("invoking transactional get request");
         self.check_allow_operation().await?;
+        let read_options = self.options.read_options.clone();
         let timestamp = self.timestamp.clone();
         let rpc = self.rpc.clone();
         let key = key.into().encode_keyspace(self.keyspace, KeyMode::Txn);
@@ -162,6 +184,7 @@ impl<PdC: PdClient> Transaction<PdC> {
             .get_or_else(key, |key| async move {
                 let request = new_get_request(key, timestamp.clone());
                 let plan = PlanBuilder::new(rpc, keyspace, request)
+                    .with_read_options(read_options)
                     .resolve_lock(timestamp, retry_options.lock_backoff, keyspace)
                     .retry_multi_region(DEFAULT_REGION_BACKOFF)
                     .merge(CollectSingle)
@@ -285,6 +308,7 @@ impl<PdC: PdClient> Transaction<PdC> {
     ) -> Result<impl Iterator<Item = KvPair>> {
         debug!("invoking transactional batch_get request");
         self.check_allow_operation().await?;
+        let read_options = self.options.read_options.clone();
         let timestamp = self.timestamp.clone();
         let rpc = self.rpc.clone();
         let keyspace = self.keyspace;
@@ -297,6 +321,7 @@ impl<PdC: PdClient> Transaction<PdC> {
             .batch_get_or_else(keys, move |keys| async move {
                 let request = new_batch_get_request(keys, timestamp.clone());
                 let plan = PlanBuilder::new(rpc, keyspace, request)
+                    .with_read_options(read_options)
                     .resolve_lock(timestamp, retry_options.lock_backoff, keyspace)
                     .retry_multi_region(retry_options.region_backoff)
                     .merge(Collect)
@@ -476,6 +501,22 @@ impl<PdC: PdClient> Transaction<PdC> {
     /// txn.commit().await.unwrap();
     /// # });
     /// ```
+    /// Stage a TiDB mem-buffer write; pessimistic locking is a separate LockKeys operation.
+    pub async fn stage_put(&mut self, key: impl Into<Key>, value: impl Into<Value>) -> Result<()> {
+        self.check_allow_operation().await?;
+        self.buffer.put(
+            key.into().encode_keyspace(self.keyspace, KeyMode::Txn),
+            value.into(),
+        );
+        Ok(())
+    }
+    pub async fn stage_delete(&mut self, key: impl Into<Key>) -> Result<()> {
+        self.check_allow_operation().await?;
+        self.buffer
+            .delete(key.into().encode_keyspace(self.keyspace, KeyMode::Txn));
+        Ok(())
+    }
+
     pub async fn put(&mut self, key: impl Into<Key>, value: impl Into<Value>) -> Result<()> {
         trace!("invoking transactional put request");
         self.check_allow_operation().await?;
@@ -824,6 +865,7 @@ impl<PdC: PdClient> Transaction<PdC> {
         reverse: bool,
     ) -> Result<impl Iterator<Item = KvPair>> {
         self.check_allow_operation().await?;
+        let read_options = self.options.read_options.clone();
         let timestamp = self.timestamp.clone();
         let rpc = self.rpc.clone();
         let retry_options = self.options.retry_options.clone();
@@ -845,6 +887,7 @@ impl<PdC: PdClient> Transaction<PdC> {
                         reverse,
                     );
                     let plan = PlanBuilder::new(rpc, keyspace, request)
+                        .with_read_options(read_options)
                         .resolve_lock(timestamp, retry_options.lock_backoff, keyspace)
                         .retry_multi_region(retry_options.region_backoff)
                         .merge(Collect)
@@ -893,58 +936,73 @@ impl<PdC: PdClient> Transaction<PdC> {
             .buffer
             .get_primary_key()
             .unwrap_or_else(|| first_key.clone());
-        let for_update_ts = self.rpc.clone().get_timestamp().await?;
-        self.options.push_for_update_ts(for_update_ts.clone());
-        let request = new_pessimistic_lock_request(
-            keys.clone().into_iter(),
-            primary_lock,
-            self.timestamp.clone(),
-            MAX_TTL,
-            for_update_ts.clone(),
-            need_value,
-        );
-        let plan = PlanBuilder::new(self.rpc.clone(), self.keyspace, request)
-            .resolve_lock(
+        let mut retry_backoff = self.options.retry_options.lock_backoff.clone();
+        loop {
+            let for_update_ts = self.rpc.clone().get_timestamp().await?;
+            self.options.push_for_update_ts(for_update_ts.clone());
+            let request = new_pessimistic_lock_request(
+                keys.clone().into_iter(),
+                primary_lock.clone(),
                 self.timestamp.clone(),
-                self.options.retry_options.lock_backoff.clone(),
-                self.keyspace,
-            )
-            .preserve_shard()
-            .retry_multi_region_preserve_results(self.options.retry_options.region_backoff.clone())
-            .merge(CollectWithShard)
-            .plan();
-        let pairs = plan.execute().await;
+                MAX_TTL,
+                for_update_ts.clone(),
+                need_value,
+            );
+            let plan = PlanBuilder::new(self.rpc.clone(), self.keyspace, request)
+                .resolve_lock(
+                    self.timestamp.clone(),
+                    self.options.retry_options.lock_backoff.clone(),
+                    self.keyspace,
+                )
+                .preserve_shard()
+                .retry_multi_region_preserve_results(
+                    self.options.retry_options.region_backoff.clone(),
+                )
+                .merge(CollectWithShard)
+                .plan();
+            let pairs = plan.execute().await;
 
-        if let Err(err) = pairs {
-            match err {
-                Error::PessimisticLockError {
-                    inner,
-                    success_keys,
-                } if !success_keys.is_empty() => {
-                    debug!(
-                        "pessimistic lock failed, rolling back {} partially-acquired lock(s), start_ts: {}, for_update_ts: {}",
-                        success_keys.len(),
-                        self.timestamp.version(),
-                        for_update_ts.version(),
-                    );
-                    let keys = success_keys.into_iter().map(Key::from);
-                    self.pessimistic_lock_rollback(keys, self.timestamp.clone(), for_update_ts)
-                        .await?;
-                    Err(*inner)
+            if let Err(err) = pairs {
+                let err = match err {
+                    Error::PessimisticLockError {
+                        inner,
+                        success_keys,
+                    } => {
+                        if !success_keys.is_empty() {
+                            self.pessimistic_lock_rollback(
+                                success_keys.into_iter().map(Key::from),
+                                self.timestamp.clone(),
+                                for_update_ts,
+                            )
+                            .await?;
+                        }
+                        *inner
+                    }
+                    err => err,
+                };
+                if is_pessimistic_retry(&err) {
+                    if let Some(delay) = retry_backoff.next_delay_duration() {
+                        tokio::time::sleep(delay).await;
+                        continue;
+                    }
                 }
-                _ => Err(err),
+                return Err(err);
+            } else {
+                // primary key will be set here if needed
+                self.buffer.primary_key_or(&first_key);
+
+                self.start_auto_heartbeat().await;
+
+                for key in keys {
+                    let key = key.key();
+                    self.options
+                        .pessimistic_keys
+                        .insert(Vec::<u8>::from(key.clone()));
+                    self.buffer.lock(key);
+                }
+
+                return pairs;
             }
-        } else {
-            // primary key will be set here if needed
-            self.buffer.primary_key_or(&first_key);
-
-            self.start_auto_heartbeat().await;
-
-            for key in keys {
-                self.buffer.lock(key.key());
-            }
-
-            pairs
         }
     }
 
@@ -1005,7 +1063,10 @@ impl<PdC: PdClient> Transaction<PdC> {
     }
 
     async fn start_auto_heartbeat(&mut self) {
-        if !self.options.heartbeat_option.is_auto_heartbeat() || self.is_heartbeat_started {
+        if crate::rpc_interceptor::disable_heartbeat(self.timestamp.version())
+            || !self.options.heartbeat_option.is_auto_heartbeat()
+            || self.is_heartbeat_started
+        {
             return;
         }
         self.is_heartbeat_started = true;
@@ -1115,15 +1176,21 @@ impl<PdC: PdClient> Drop for Transaction<PdC> {
             let start_ts = self.timestamp.version();
             match self.options.check_level {
                 CheckLevel::Panic => {
-                    panic!("dropping an active transaction (start_ts: {start_ts}). Consider commit or rollback it.")
+                    panic!(
+                        "dropping an active transaction (start_ts: {start_ts}). Consider commit or rollback it."
+                    )
                 }
                 CheckLevel::Warn => {
-                    warn!("dropping an active transaction, start_ts: {start_ts}. Consider commit or rollback it.")
+                    warn!(
+                        "dropping an active transaction, start_ts: {start_ts}. Consider commit or rollback it."
+                    )
                 }
                 // Even with the drop check disabled, leave a debug breadcrumb so
                 // an unfinished transaction is not completely silent.
                 CheckLevel::None => {
-                    debug!("dropping an active transaction (drop check disabled), start_ts: {start_ts}")
+                    debug!(
+                        "dropping an active transaction (drop check disabled), start_ts: {start_ts}"
+                    )
                 }
             }
         }
@@ -1155,6 +1222,8 @@ pub enum TransactionKind {
 /// `TransactionOptions` has a builder-style API.
 #[derive(Clone, PartialEq, Debug)]
 pub struct TransactionOptions {
+    pessimistic_keys: std::collections::HashSet<Vec<u8>>,
+    pub(crate) read_options: Option<crate::ReadOptions>,
     /// Optimistic or pessimistic (default) transaction.
     kind: TransactionKind,
     /// Try using 1pc rather than 2pc (default is to always use 2pc).
@@ -1189,6 +1258,8 @@ impl TransactionOptions {
     /// Default options for an optimistic transaction.
     pub fn new_optimistic() -> TransactionOptions {
         TransactionOptions {
+            pessimistic_keys: Default::default(),
+            read_options: None,
             kind: TransactionKind::Optimistic,
             try_one_pc: false,
             async_commit: false,
@@ -1203,6 +1274,8 @@ impl TransactionOptions {
     /// Default options for a pessimistic transaction.
     pub fn new_pessimistic() -> TransactionOptions {
         TransactionOptions {
+            pessimistic_keys: Default::default(),
+            read_options: None,
             kind: TransactionKind::Pessimistic(Timestamp::from_version(0)),
             try_one_pc: false,
             async_commit: false,
@@ -1397,7 +1470,6 @@ impl<PdC: PdClient> Committer<PdC> {
         }
 
         let commit_ts = if self.options.async_commit {
-            // FIXME: min_commit_ts == 0 => fallback to normal 2PC
             min_commit_ts.unwrap()
         } else {
             match self.commit_primary_with_retry().await {
@@ -1427,7 +1499,10 @@ impl<PdC: PdClient> Committer<PdC> {
         );
         let primary_lock = self.primary_key.clone().unwrap();
         let elapsed = self.start_instant.elapsed().as_millis() as u64;
-        let lock_ttl = self.calc_txn_lock_ttl();
+        let lock_ttl = crate::rpc_interceptor::lock_ttl(
+            self.start_version.version(),
+            self.calc_txn_lock_ttl(),
+        );
         let mut request = match &self.options.kind {
             TransactionKind::Optimistic => new_prewrite_request(
                 self.mutations.clone(),
@@ -1448,6 +1523,19 @@ impl<PdC: PdClient> Committer<PdC> {
             .context
             .get_or_insert_with(kvrpcpb::Context::default)
             .disk_full_opt = self.options.disk_full_opt as i32;
+        if self.options.is_pessimistic() {
+            request.pessimistic_actions = request
+                .mutations
+                .iter()
+                .map(|mutation| {
+                    if self.options.pessimistic_keys.contains(&mutation.key) {
+                        kvrpcpb::prewrite_request::PessimisticAction::DoPessimisticCheck as i32
+                    } else {
+                        kvrpcpb::prewrite_request::PessimisticAction::DoConstraintCheck as i32
+                    }
+                })
+                .collect();
+        }
         request.use_async_commit = self.options.async_commit;
         request.try_one_pc = self.options.try_one_pc;
         request.secondaries = self
@@ -1486,6 +1574,12 @@ impl<PdC: PdClient> Committer<PdC> {
         }
 
         self.options.try_one_pc = false;
+        // Any shard can reject async commit. A zero min_commit_ts is the
+        // protocol's fallback signal, never a timestamp to commit at.
+        if self.options.async_commit && response.iter().any(|response| response.min_commit_ts == 0)
+        {
+            self.options.async_commit = false;
+        }
 
         let min_commit_ts = response
             .iter()
@@ -1569,13 +1663,19 @@ impl<PdC: PdClient> Committer<PdC> {
                     Some(Error::KeyError(key_err)) => {
                         if let Some(expired) = key_err.commit_ts_expired {
                             // Ref: https://github.com/tikv/client-go/blob/tidb-8.5/txnkv/transaction/commit.go
-                            info!("2PC commit_ts rejected by TiKV, retry with a newer commit_ts, start_ts: {}",
-                                self.start_version.version());
+                            info!(
+                                "2PC commit_ts rejected by TiKV, retry with a newer commit_ts, start_ts: {}",
+                                self.start_version.version()
+                            );
 
                             let primary_key = self.primary_key.as_ref().unwrap();
                             if primary_key != expired.key.as_ref() {
-                                error!("2PC commit_ts rejected by TiKV, but the key is not the primary key, start_ts: {}, key: {}, primary: {}",
-                                    self.start_version.version(), format_key_for_log(&expired.key), format_key_for_log(primary_key));
+                                error!(
+                                    "2PC commit_ts rejected by TiKV, but the key is not the primary key, start_ts: {}, key: {}, primary: {}",
+                                    self.start_version.version(),
+                                    format_key_for_log(&expired.key),
+                                    format_key_for_log(primary_key)
+                                );
                                 return Err(Error::StringError("2PC commitTS rejected by TiKV, but the key is not the primary key".to_string()));
                             }
 
@@ -1586,8 +1686,10 @@ impl<PdC: PdClient> Committer<PdC> {
                                 .saturating_sub(expired.attempted_commit_ts)
                                 > 943718400000
                             {
-                                let msg = format!("2PC min_commit_ts is too large, we got min_commit_ts: {}, and attempted_commit_ts: {}",
-                                                     expired.min_commit_ts, expired.attempted_commit_ts);
+                                let msg = format!(
+                                    "2PC min_commit_ts is too large, we got min_commit_ts: {}, and attempted_commit_ts: {}",
+                                    expired.min_commit_ts, expired.attempted_commit_ts
+                                );
                                 return Err(Error::StringError(msg));
                             }
                             continue;
@@ -1990,3 +2092,21 @@ mod tests {
         )));
     }
 }
+
+// TiKV signals lock-wait wakeups separately from terminal MVCC conflicts.
+fn is_pessimistic_retry(error: &Error) -> bool {
+    match error {
+        Error::KeyError(error) => error.conflict.as_ref().is_some_and(|conflict| {
+            conflict.reason == kvrpcpb::write_conflict::Reason::PessimisticRetry as i32
+        }),
+        Error::ExtractedErrors(errors) | Error::MultipleKeyErrors(errors) => {
+            !errors.is_empty() && errors.iter().all(is_pessimistic_retry)
+        }
+        Error::PessimisticLockError { inner, .. } => is_pessimistic_retry(inner),
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+#[path = "pessimistic_retry_test.rs"]
+mod pessimistic_retry_test;

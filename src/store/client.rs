@@ -1,3 +1,4 @@
+// Copyright 2026 AsterSQL.
 // Copyright 2020 TiKV Project Authors. Licensed under Apache-2.0.
 
 use std::any::Any;
@@ -48,6 +49,13 @@ impl KvConnect for TikvConnect {
 #[async_trait]
 pub trait KvClient {
     async fn dispatch(&self, req: &dyn Request) -> Result<Box<dyn Any>>;
+    async fn dispatch_with_timeout(
+        &self,
+        req: &dyn Request,
+        _timeout: Option<Duration>,
+    ) -> Result<Box<dyn Any>> {
+        self.dispatch(req).await
+    }
 }
 
 /// This client handles requests for a single TiKV node. It converts the data
@@ -61,6 +69,36 @@ pub struct KvRpcClient {
 #[async_trait]
 impl KvClient for KvRpcClient {
     async fn dispatch(&self, request: &dyn Request) -> Result<Box<dyn Any>> {
-        request.dispatch(&self.rpc_client, self.timeout).await
+        self.dispatch_with_timeout(request, None).await
+    }
+    async fn dispatch_with_timeout(
+        &self,
+        request: &dyn Request,
+        timeout: Option<Duration>,
+    ) -> Result<Box<dyn Any>> {
+        let hooks = crate::rpc_interceptor::snapshot();
+        let mut timeout = timeout.unwrap_or(self.timeout);
+        for hook in &hooks {
+            hook.before(request.as_any(), &mut timeout)?;
+        }
+        let delay = hooks.iter().fold(Duration::ZERO, |delay, hook| {
+            delay.saturating_add(hook.delay(request.as_any()))
+        });
+        let mut response = tokio::time::timeout(timeout, async {
+            if !delay.is_zero() {
+                tokio::time::sleep(delay).await;
+            }
+            request.dispatch(&self.rpc_client, timeout).await
+        })
+        .await
+        .unwrap_or_else(|_| {
+            Err(crate::Error::GrpcAPI(tonic::Status::deadline_exceeded(
+                "TiKV RPC deadline elapsed",
+            )))
+        });
+        for hook in &hooks {
+            hook.after(request.as_any(), &mut response);
+        }
+        response
     }
 }

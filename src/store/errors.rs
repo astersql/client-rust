@@ -1,3 +1,4 @@
+// Copyright 2026 AsterSQL.
 // Copyright 2019 TiKV Project Authors. Licensed under Apache-2.0.
 
 use crate::proto::kvrpcpb;
@@ -50,6 +51,7 @@ has_region_error!(kvrpcpb::CheckSecondaryLocksResponse);
 has_region_error!(kvrpcpb::DeleteRangeResponse);
 has_region_error!(kvrpcpb::GcResponse);
 has_region_error!(kvrpcpb::UnsafeDestroyRangeResponse);
+has_region_error!(kvrpcpb::GetLockWaitInfoResponse);
 has_region_error!(kvrpcpb::RawGetResponse);
 has_region_error!(kvrpcpb::RawBatchGetResponse);
 has_region_error!(kvrpcpb::RawGetKeyTtlResponse);
@@ -111,6 +113,7 @@ has_str_error!(kvrpcpb::RawCoprocessorResponse);
 has_str_error!(kvrpcpb::ImportResponse);
 has_str_error!(kvrpcpb::DeleteRangeResponse);
 has_str_error!(kvrpcpb::UnsafeDestroyRangeResponse);
+has_str_error!(kvrpcpb::GetLockWaitInfoResponse);
 
 impl HasKeyErrors for kvrpcpb::ScanResponse {
     fn key_errors(&mut self) -> Option<Vec<Error>> {

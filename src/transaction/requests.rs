@@ -1,3 +1,4 @@
+// Copyright 2026 AsterSQL.
 // Copyright 2020 TiKV Project Authors. Licensed under Apache-2.0.
 
 use std::cmp;
@@ -260,30 +261,44 @@ impl Shardable for kvrpcpb::PrewriteRequest {
         let mut mutations = self.mutations.clone();
         mutations.sort_by(|a, b| a.key.cmp(&b.key));
 
+        let batch_size =
+            crate::rpc_interceptor::prewrite_batch_size(self.start_version, TXN_COMMIT_BATCH_SIZE);
         region_stream_for_keys(mutations.into_iter(), pd_client.clone())
-            .flat_map(|result| match result {
-                Ok((mutations, region)) => stream::iter(kvrpcpb::PrewriteRequest::batches(
-                    mutations,
-                    TXN_COMMIT_BATCH_SIZE,
-                ))
-                .map(move |batch| Ok((batch, region.clone())))
-                .boxed(),
+            .flat_map(move |result| match result {
+                Ok((mutations, region)) => {
+                    stream::iter(kvrpcpb::PrewriteRequest::batches(mutations, batch_size))
+                        .map(move |batch| Ok((batch, region.clone())))
+                        .boxed()
+                }
                 Err(e) => stream::iter(Err(e)).boxed(),
             })
             .boxed()
     }
 
     fn apply_shard(&mut self, shard: Self::Shard) {
-        // Only need to set secondary keys if we're sending the primary key.
-        if self.use_async_commit && !self.mutations.iter().any(|m| m.key == self.primary_lock) {
-            self.secondaries = vec![];
-        }
-
-        // Only if there is only one request to send
+        // Only if there is only one request to send. Use the complete
+        // secondary list before clearing it on non-primary shards.
         if self.try_one_pc && shard.len() != self.secondaries.len() + 1 {
             self.try_one_pc = false;
         }
 
+        // Only need to set secondary keys if we're sending the primary key.
+        if self.use_async_commit && !shard.iter().any(|m| m.key == self.primary_lock) {
+            self.secondaries = vec![];
+        }
+
+        if !self.pessimistic_actions.is_empty() {
+            let actions: std::collections::HashMap<_, _> = self
+                .mutations
+                .iter()
+                .zip(&self.pessimistic_actions)
+                .map(|(mutation, action)| (mutation.key.clone(), *action))
+                .collect();
+            self.pessimistic_actions = shard
+                .iter()
+                .map(|mutation| actions[&mutation.key])
+                .collect();
+        }
         self.mutations = shard;
     }
 
@@ -889,6 +904,26 @@ impl Merge<kvrpcpb::UnsafeDestroyRangeResponse> for Collect {
     }
 }
 
+impl KvRequest for kvrpcpb::GetLockWaitInfoRequest {
+    type Response = kvrpcpb::GetLockWaitInfoResponse;
+}
+impl StoreRequest for kvrpcpb::GetLockWaitInfoRequest {
+    fn apply_store(&mut self, _store: &Store) {}
+}
+impl HasLocks for kvrpcpb::GetLockWaitInfoResponse {}
+impl Merge<kvrpcpb::GetLockWaitInfoResponse> for Collect {
+    type Out = Vec<crate::proto::deadlock::WaitForEntry>;
+    fn merge(&self, input: Vec<Result<kvrpcpb::GetLockWaitInfoResponse>>) -> Result<Self::Out> {
+        // Like Go GetLockWaits, a failed store must not hide other stores' waits.
+        Ok(input
+            .into_iter()
+            .filter_map(Result::ok)
+            .filter(|response| response.region_error.is_none() && response.error.is_empty())
+            .flat_map(|response| response.entries)
+            .collect())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::common::Error::PessimisticLockError;
@@ -992,3 +1027,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "requests_parity_test.rs"]
+mod requests_parity_test;
