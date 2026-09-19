@@ -17,6 +17,7 @@ pub use sync_client::SyncTransactionClient;
 pub use sync_snapshot::SyncSnapshot;
 pub use sync_transaction::SyncTransaction;
 pub use transaction::CheckLevel;
+pub use transaction::FairLockDetails;
 #[doc(hidden)]
 pub use transaction::HeartbeatOption;
 pub use transaction::Mutation;

@@ -17,6 +17,7 @@ use crate::Value;
 use super::transaction::Mutation;
 
 /// A caching layer which buffers reads and writes in a transaction.
+#[derive(Clone)]
 pub struct Buffer {
     primary_key: Option<Key>,
     entry_map: BTreeMap<Key, BufferEntry>,

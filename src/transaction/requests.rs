@@ -5,7 +5,6 @@ use std::cmp;
 use std::iter;
 use std::sync::Arc;
 
-use either::Either;
 use futures::stream::BoxStream;
 use futures::stream::{self};
 use futures::StreamExt;
@@ -23,7 +22,6 @@ use crate::proto::pdpb::Timestamp;
 use crate::region::RegionWithLeader;
 use crate::request::Collect;
 use crate::request::CollectSingle;
-use crate::request::CollectWithShard;
 use crate::request::DefaultProcessor;
 use crate::request::HasNextBatch;
 use crate::request::KvRequest;
@@ -416,6 +414,7 @@ pub fn new_pessimistic_lock_request(
     lock_ttl: u64,
     for_update_ts: u64,
     need_value: bool,
+    wait_timeout_ms: i64,
 ) -> kvrpcpb::PessimisticLockRequest {
     let mut req = kvrpcpb::PessimisticLockRequest::default();
     req.mutations = mutations;
@@ -423,9 +422,8 @@ pub fn new_pessimistic_lock_request(
     req.start_version = start_version;
     req.lock_ttl = lock_ttl;
     req.for_update_ts = for_update_ts;
-    // FIXME: make them configurable
     req.is_first_lock = false;
-    req.wait_timeout = 0;
+    req.wait_timeout = wait_timeout_ms;
     req.return_values = need_value;
     // FIXME: support large transaction
     req.min_commit_ts = 0;
@@ -460,10 +458,13 @@ impl Shardable for kvrpcpb::PessimisticLockRequest {
 
 // PessimisticLockResponse returns values that preserves the order with keys in request, thus the
 // kvpair result should be produced by zipping the keys in request and the values in respponse.
+#[derive(Clone, Debug)]
+pub(crate) struct CollectPessimisticLockWithShard;
+
 impl Merge<ResponseWithShard<kvrpcpb::PessimisticLockResponse, Vec<kvrpcpb::Mutation>>>
-    for CollectWithShard
+    for CollectPessimisticLockWithShard
 {
-    type Out = Vec<KvPair>;
+    type Out = (Vec<KvPair>, Vec<kvrpcpb::PessimisticLockKeyResult>);
 
     fn merge(
         &self,
@@ -487,10 +488,26 @@ impl Merge<ResponseWithShard<kvrpcpb::PessimisticLockResponse, Vec<kvrpcpb::Muta
                 success_keys,
             })
         } else {
-            Ok(input
+            let mut key_results = Vec::new();
+            let pairs = input
                 .into_iter()
                 .map(Result::unwrap)
                 .flat_map(|ResponseWithShard(resp, mutations)| {
+                    if !resp.results.is_empty() {
+                        key_results.extend(resp.results.iter().cloned());
+                        return mutations
+                            .into_iter()
+                            .map(|mutation| mutation.key)
+                            .zip(resp.results)
+                            .filter_map(|(key, result)| {
+                                (result.r#type
+                                    != kvrpcpb::PessimisticLockKeyResultType::LockResultFailed
+                                        as i32
+                                    && result.existence)
+                                    .then(|| KvPair::new(key, result.value))
+                            })
+                            .collect::<Vec<_>>();
+                    }
                     let values: Vec<Vec<u8>> = resp.values;
                     let values_len = values.len();
                     let not_founds = resp.not_founds;
@@ -504,19 +521,27 @@ impl Merge<ResponseWithShard<kvrpcpb::PessimisticLockResponse, Vec<kvrpcpb::Muta
                         // Legacy TiKV does not distinguish not existing key and existing key
                         // that with empty value. We assume that key does not exist if value
                         // is empty.
-                        Either::Left(kvpairs.filter(|kvpair| !kvpair.value().is_empty()))
+                        kvpairs
+                            .filter(|kvpair| !kvpair.value().is_empty())
+                            .collect::<Vec<_>>()
                     } else {
                         assert_eq!(kvpairs.len(), not_founds.len());
-                        Either::Right(kvpairs.zip(not_founds).filter_map(|(kvpair, not_found)| {
-                            if not_found {
-                                None
-                            } else {
-                                Some(kvpair)
-                            }
-                        }))
+                        kvpairs
+                            .zip(not_founds)
+                            .filter_map(
+                                |(kvpair, not_found)| {
+                                    if not_found {
+                                        None
+                                    } else {
+                                        Some(kvpair)
+                                    }
+                                },
+                            )
+                            .collect::<Vec<_>>()
                     }
                 })
-                .collect())
+                .collect();
+            Ok((pairs, key_results))
         }
     }
 }
@@ -926,11 +951,11 @@ impl Merge<kvrpcpb::GetLockWaitInfoResponse> for Collect {
 
 #[cfg(test)]
 mod tests {
+    use super::CollectPessimisticLockWithShard;
     use crate::common::Error::PessimisticLockError;
     use crate::common::Error::ResolveLockError;
     use crate::proto::kvrpcpb;
     use crate::request::plan::Merge;
-    use crate::request::CollectWithShard;
     use crate::request::ResponseWithShard;
     use crate::KvPair;
 
@@ -984,7 +1009,7 @@ mod tests {
             ],
         );
 
-        let merger = CollectWithShard {};
+        let merger = CollectPessimisticLockWithShard {};
         {
             // empty values & not founds are filtered.
             let input = vec![
@@ -995,7 +1020,7 @@ mod tests {
             let result = merger.merge(input);
 
             assert_eq!(
-                result.unwrap(),
+                result.unwrap().0,
                 vec![
                     KvPair::new(key1.to_vec(), value1.to_vec()),
                     KvPair::new(key4.to_vec(), value4.to_vec()),
@@ -1031,3 +1056,7 @@ mod tests {
 #[cfg(test)]
 #[path = "requests_parity_test.rs"]
 mod requests_parity_test;
+
+#[cfg(test)]
+#[path = "requests_wait_test.rs"]
+mod requests_wait_test;

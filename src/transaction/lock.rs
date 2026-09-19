@@ -43,25 +43,36 @@ pub(crate) fn format_key_for_log(key: &[u8]) -> String {
     format!("len={}, prefix={}", key.len(), HexRepr(&key[..prefix_len]))
 }
 
-/// Refuse to resolve SHARED locks — loudly, before any of them can be mis-handled.
+/// Detect SHARED locks before any wrapper can be mis-handled.
 ///
 /// The contract (`kvrpcpb.LockInfo.shared_lock_infos`) is explicit: a shared lock's
 /// real holders live ONLY in `shared_lock_infos` — "DO NOT read from the wrapper
 /// LockInfo", whose own `key`/`lock_version` are unset. This client does not implement
-/// shared-lock resolution yet, and every partial handling is worse than none:
+/// shared-lock resolution yet, and every partial cleanup is worse than none:
 /// resolving the wrapper checks transaction 0; filtering on wrapper fields silently
 /// drops the members; and the pessimistic-lock special cases in this resolver do not
-/// know `SharedPessimisticLock`. Until support lands, an explicit error is the only
-/// answer that cannot roll back a live transaction or skip a dead one.
+/// know `SharedPessimisticLock`. Read/lock request resolution treats these wrappers
+/// as still live and retries; cleanup rejects them explicitly.
 ///
 /// Servers that predate shared locks never produce them, so this is a no-op there.
-pub(crate) fn reject_shared_locks(locks: &[kvrpcpb::LockInfo]) -> Result<()> {
-    let shared = |l: &kvrpcpb::LockInfo| {
+pub(crate) fn contains_shared_locks(locks: &[kvrpcpb::LockInfo]) -> bool {
+    locks.iter().any(|l| {
         !l.shared_lock_infos.is_empty()
             || l.lock_type == kvrpcpb::Op::SharedLock as i32
             || l.lock_type == kvrpcpb::Op::SharedPessimisticLock as i32
-    };
-    if locks.iter().any(shared) {
+    })
+}
+
+pub(crate) fn shared_locks_contain_transaction(locks: &[kvrpcpb::LockInfo], start_ts: u64) -> bool {
+    locks.iter().any(|lock| {
+        lock.shared_lock_infos
+            .iter()
+            .any(|holder| holder.lock_version == start_ts)
+    })
+}
+
+pub(crate) fn reject_shared_locks(locks: &[kvrpcpb::LockInfo]) -> Result<()> {
+    if contains_shared_locks(locks) {
         return Err(Error::StringError(
             "shared locks (SharedLock/SharedPessimisticLock) are not supported by this \
              client yet; refusing to resolve them — resolving the wrapper would target \
@@ -85,7 +96,12 @@ pub async fn resolve_locks(
     keyspace: Keyspace,
 ) -> Result<Vec<kvrpcpb::LockInfo> /* live_locks */> {
     debug!("resolving locks");
-    reject_shared_locks(&locks)?;
+    // Shared-lock wrappers cannot be resolved holder-by-holder yet. Treat them
+    // as live so the caller can retry the original request after a backoff;
+    // cleanup_locks still rejects them to prevent rolling back transaction 0.
+    if contains_shared_locks(&locks) {
+        return Ok(locks);
+    }
     let ts = pd_client.clone().get_timestamp().await?;
     let caller_start_ts = timestamp.version();
     let current_ts = ts.version();
@@ -172,6 +188,10 @@ pub async fn resolve_locks(
     }
     Ok(live_locks)
 }
+
+#[cfg(test)]
+#[path = "lock_shared_test.rs"]
+mod lock_shared_test;
 
 async fn resolve_lock_with_retry(
     #[allow(clippy::ptr_arg)] key: &Vec<u8>,

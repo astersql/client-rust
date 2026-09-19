@@ -1,3 +1,4 @@
+// Copyright 2026 AsterSQL.
 // Copyright 2021 TiKV Project Authors. Licensed under Apache-2.0.
 
 use std::iter::Iterator;
@@ -144,12 +145,18 @@ pub fn new_pessimistic_lock_request(
     lock_ttl: u64,
     for_update_ts: Timestamp,
     need_value: bool,
+    wait_timeout_ms: i64,
+    shared: bool,
 ) -> kvrpcpb::PessimisticLockRequest {
     requests::new_pessimistic_lock_request(
         locks
             .map(|pl| {
                 let mut mutation = kvrpcpb::Mutation::default();
-                mutation.op = kvrpcpb::Op::PessimisticLock.into();
+                mutation.op = if shared {
+                    kvrpcpb::Op::SharedPessimisticLock.into()
+                } else {
+                    kvrpcpb::Op::PessimisticLock.into()
+                };
                 mutation.assertion = pl.assertion().into();
                 mutation.key = pl.key().into();
                 mutation
@@ -160,6 +167,7 @@ pub fn new_pessimistic_lock_request(
         lock_ttl,
         for_update_ts.version(),
         need_value,
+        wait_timeout_ms,
     )
 }
 
@@ -189,3 +197,7 @@ pub fn new_unsafe_destroy_range_request(range: BoundRange) -> kvrpcpb::UnsafeDes
     let (start_key, end_key) = range.into_keys();
     requests::new_unsafe_destroy_range_request(start_key.into(), end_key.unwrap_or_default().into())
 }
+
+#[cfg(test)]
+#[path = "lowering_shared_test.rs"]
+mod lowering_shared_test;
