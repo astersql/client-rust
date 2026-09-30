@@ -35,6 +35,14 @@ impl Snapshot {
         self.transaction.get(key).await
     }
 
+    /// Get a value and the MVCC commit timestamp of its visible version.
+    pub async fn get_with_commit_ts(
+        &mut self,
+        key: impl Into<Key>,
+    ) -> Result<Option<(Value, u64)>> {
+        self.transaction.get_committed_with_commit_ts(key).await
+    }
+
     /// Check whether the key exists.
     pub async fn key_exists(&mut self, key: impl Into<Key>) -> Result<bool> {
         debug!("invoking key_exists request on snapshot");

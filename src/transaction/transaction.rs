@@ -24,11 +24,13 @@ use crate::proto::pdpb::Timestamp;
 use crate::request::Collect;
 use crate::request::CollectError;
 use crate::request::CollectSingle;
+use crate::request::DefaultProcessor;
 use crate::request::EncodeKeyspace;
 use crate::request::KeyMode;
 use crate::request::Keyspace;
 use crate::request::Plan;
 use crate::request::PlanBuilder;
+use crate::request::Process;
 use crate::request::RetryOptions;
 use crate::request::TruncateKeyspace;
 use crate::timestamp::TimestampExt;
@@ -257,6 +259,34 @@ impl<PdC: PdClient> Transaction<PdC> {
                 plan.execute().await
             })
             .await
+    }
+
+    /// Read a committed value together with the visible version's commit timestamp.
+    /// This is used by MVCC maintenance jobs that must fence their deletions by
+    /// commit time. It reads from TiKV directly and should only be called on a
+    /// read-only snapshot, where no buffered writes can shadow the result.
+    pub(crate) async fn get_committed_with_commit_ts(
+        &mut self,
+        key: impl Into<Key>,
+    ) -> Result<Option<(Value, u64)>> {
+        self.check_allow_operation().await?;
+        let key = key.into().encode_keyspace(self.keyspace, KeyMode::Txn);
+        let mut request = new_get_request(key, self.timestamp.clone());
+        request.need_commit_ts = true;
+        let plan = PlanBuilder::new(self.rpc.clone(), self.keyspace, request)
+            .with_read_options(self.options.read_options.clone())
+            .resolve_lock(
+                self.timestamp.clone(),
+                self.options.retry_options.lock_backoff.clone(),
+                self.keyspace,
+            )
+            .retry_multi_region(DEFAULT_REGION_BACKOFF)
+            .merge(CollectSingle)
+            .plan();
+        let response = plan.execute().await?;
+        let commit_ts = response.commit_ts;
+        let value = DefaultProcessor.process(Ok(response))?;
+        Ok(value.map(|value| (value, commit_ts)))
     }
 
     /// Create a `get for update` request.
@@ -2030,7 +2060,7 @@ impl<PdC: PdClient> Committer<PdC> {
         let plan = PlanBuilder::new(self.rpc, self.keyspace, req)
             .resolve_lock(
                 start_version,
-                self.options.retry_options.lock_backoff,
+                self.options.retry_options.lock_backoff.clone(),
                 self.keyspace,
             )
             .retry_multi_region(self.options.retry_options.region_backoff)
