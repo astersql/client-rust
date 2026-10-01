@@ -41,7 +41,9 @@ fn go_merge_187_runtime_evidence_bridge() {
 async fn go_merge_187_runtime_evidence_bridge_dispatch() {
     use crate::request::{Keyspace, Plan, PlanBuilder};
     let pd = Arc::new(crate::mock::MockPdClient::new(
-        crate::mock::MockKvClient::with_dispatch_hook(|_| {
+        crate::mock::MockKvClient::with_dispatch_hook(|request| {
+            let request = request.downcast_ref::<kvrpcpb::GetRequest>().unwrap();
+            assert!(request.context.as_ref().unwrap().record_scan_stat);
             Ok(Box::new(kvrpcpb::GetResponse {
                 value: vec![7, 8],
                 exec_details_v2: Some(kvrpcpb::ExecDetailsV2 {

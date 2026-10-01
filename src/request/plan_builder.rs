@@ -50,6 +50,9 @@ impl PlanBuilderPhase for Targetted {}
 
 impl<PdC: PdClient, Req: KvRequest> PlanBuilder<PdC, Dispatch<Req>, NoTarget> {
     pub fn with_read_options(mut self, options: Option<crate::ReadOptions>) -> Self {
+        self.plan
+            .request
+            .set_collect_runtime_stats(options.is_some());
         self.plan.read_options = options;
         self
     }
