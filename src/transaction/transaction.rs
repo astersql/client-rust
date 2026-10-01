@@ -158,7 +158,36 @@ pub struct Transaction<PdC: PdClient = PdRpcClient> {
     start_instant: Instant,
 }
 
+/// Caller-supplied schema validation with the transaction's captured schema context.
+#[derive(Clone)]
+pub struct SchemaLeaseChecker(Arc<dyn Fn(u64) -> Result<()> + Send + Sync>);
+impl SchemaLeaseChecker {
+    pub fn new(check: impl Fn(u64) -> Result<()> + Send + Sync + 'static) -> Self {
+        Self(Arc::new(check))
+    }
+    fn check(&self, timestamp: u64) -> Result<()> {
+        (self.0)(timestamp)
+    }
+}
+impl std::fmt::Debug for SchemaLeaseChecker {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SchemaLeaseChecker")
+    }
+}
+impl PartialEq for SchemaLeaseChecker {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
 impl<PdC: PdClient> Transaction<PdC> {
+    /// Set the server-enforced window for async commit and 1PC (Go defaults to 2s).
+    pub fn set_schema_safe_window(&mut self, window: Duration) {
+        self.options.schema_safe_window = window;
+    }
+    pub fn set_schema_lease_checker(&mut self, checker: Option<SchemaLeaseChecker>) {
+        self.options.schema_lease_checker = checker;
+    }
     pub fn set_read_options(&mut self, options: Option<crate::ReadOptions>) {
         self.options.read_options = options;
     }
@@ -1520,6 +1549,8 @@ pub enum TransactionKind {
 /// `TransactionOptions` has a builder-style API.
 #[derive(Clone, PartialEq, Debug)]
 pub struct TransactionOptions {
+    schema_lease_checker: Option<SchemaLeaseChecker>,
+    schema_safe_window: Duration,
     pessimistic_keys: std::collections::HashSet<Vec<u8>>,
     pub(crate) read_options: Option<crate::ReadOptions>,
     /// Optimistic or pessimistic (default) transaction.
@@ -1556,6 +1587,8 @@ impl TransactionOptions {
     /// Default options for an optimistic transaction.
     pub fn new_optimistic() -> TransactionOptions {
         TransactionOptions {
+            schema_lease_checker: None,
+            schema_safe_window: Duration::from_secs(2),
             pessimistic_keys: Default::default(),
             read_options: None,
             kind: TransactionKind::Optimistic,
@@ -1572,6 +1605,8 @@ impl TransactionOptions {
     /// Default options for a pessimistic transaction.
     pub fn new_pessimistic() -> TransactionOptions {
         TransactionOptions {
+            schema_lease_checker: None,
+            schema_safe_window: Duration::from_secs(2),
             pessimistic_keys: Default::default(),
             read_options: None,
             kind: TransactionKind::Pessimistic(Timestamp::from_version(0)),
@@ -1842,7 +1877,34 @@ impl<PdC: PdClient> Committer<PdC> {
             .filter(|m| self.primary_key.as_ref().unwrap() != m.key.as_ref())
             .map(|m| m.key.clone())
             .collect();
-        // FIXME set max_commit_ts and min_commit_ts
+        // Async commit and 1PC can become durable during prewrite. Validate
+        // before that RPC, then let TiKV enforce Go's maximum commit timestamp.
+        // A server fallback to 2PC is checked again at its actual commit TS.
+        if self.options.async_commit || self.options.try_one_pc {
+            let elapsed_ms = u64::try_from(self.start_instant.elapsed().as_millis())
+                .map_err(|_| Error::StringError("transaction elapsed time overflow".into()))?;
+            let current_ts = self
+                .start_version
+                .version()
+                .checked_add(
+                    elapsed_ms
+                        .checked_mul(1 << 18)
+                        .ok_or_else(|| Error::StringError("schema timestamp overflow".into()))?,
+                )
+                .ok_or_else(|| Error::StringError("schema timestamp overflow".into()))?;
+            if let Some(checker) = &self.options.schema_lease_checker {
+                checker.check(current_ts)?;
+            }
+            let window_ms = u64::try_from(self.options.schema_safe_window.as_millis())
+                .map_err(|_| Error::StringError("schema safe window overflow".into()))?;
+            request.max_commit_ts = current_ts
+                .checked_add(
+                    window_ms
+                        .checked_mul(1 << 18)
+                        .ok_or_else(|| Error::StringError("schema safe window overflow".into()))?,
+                )
+                .ok_or_else(|| Error::StringError("schema safe window overflow".into()))?;
+        }
 
         let builder = PlanBuilder::new(self.rpc.clone(), self.keyspace, request).resolve_lock(
             self.start_version.clone(),
@@ -1899,6 +1961,9 @@ impl<PdC: PdClient> Committer<PdC> {
         );
         let primary_key = self.primary_key.clone().into_iter();
         let commit_version = self.rpc.clone().get_timestamp().await?;
+        if let Some(checker) = &self.options.schema_lease_checker {
+            checker.check(commit_version.version())?;
+        }
         let mut req = new_commit_request(
             primary_key,
             self.start_version.clone(),

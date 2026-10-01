@@ -187,3 +187,5 @@ pub use read_options::{ReadAttempt, ReadOptions, ReadStats};
 
 #[cfg(test)]
 mod read_options_test;
+
+pub use crate::transaction::SchemaLeaseChecker;

@@ -22,6 +22,7 @@ pub use transaction::FairLockDetails;
 pub use transaction::HeartbeatOption;
 pub use transaction::Mutation;
 pub use transaction::Scanner;
+pub use transaction::SchemaLeaseChecker;
 pub use transaction::Transaction;
 pub use transaction::TransactionOptions;
 
@@ -42,3 +43,6 @@ mod sync_snapshot;
 mod sync_transaction;
 #[allow(clippy::module_inception)]
 mod transaction;
+
+#[cfg(test)]
+mod schema_lease_checker_test;
