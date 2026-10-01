@@ -111,6 +111,9 @@ impl<Req: KvRequest> Plan for Dispatch<Req> {
                     .is_some_and(crate::read_options::is_read_timeout),
             );
         }
+        if let (Some(options), Ok(response)) = (&self.read_options, &result) {
+            options.stats.record_response(response.as_ref());
+        }
         let result = stats.done(result);
         result.map(|r| {
             *r.downcast()

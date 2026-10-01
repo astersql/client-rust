@@ -183,7 +183,7 @@ pub use crate::transaction::Transaction;
 pub use crate::transaction::TransactionOptions;
 
 pub mod read_options;
-pub use read_options::{ReadAttempt, ReadOptions, ReadStats};
+pub use read_options::{PointResponseStats, ReadAttempt, ReadOptions, ReadStats};
 
 #[cfg(test)]
 mod read_options_test;
