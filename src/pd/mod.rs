@@ -1,3 +1,4 @@
+// Copyright 2026 AsterSQL.
 mod client;
 mod cluster;
 mod retry;
@@ -9,3 +10,6 @@ pub use self::cluster::Cluster;
 pub use self::cluster::Connection;
 pub use self::retry::RetryClient;
 pub use self::retry::RetryClientTrait;
+
+mod metadata;
+pub use metadata::MetadataClient;

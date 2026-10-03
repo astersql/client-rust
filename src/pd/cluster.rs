@@ -1,3 +1,4 @@
+// Copyright 2026 AsterSQL.
 // Copyright 2018 TiKV Project Authors. Licensed under Apache-2.0.
 
 use std::collections::HashSet;
@@ -43,6 +44,12 @@ macro_rules! pd_request {
 
 // These methods make a single attempt to make a request.
 impl Cluster {
+    pub async fn get_members(&mut self, timeout: Duration) -> Result<pdpb::GetMembersResponse> {
+        pd_request!(self.id, pdpb::GetMembersRequest)
+            .send(&mut self.client, timeout)
+            .await
+    }
+
     pub async fn get_region(
         &mut self,
         key: Vec<u8>,
@@ -457,6 +464,20 @@ impl PdResponse for pdpb::UpdateGcSafePointResponse {
 }
 
 impl PdResponse for keyspacepb::LoadKeyspaceResponse {
+    fn header(&self) -> &pdpb::ResponseHeader {
+        self.header.as_ref().unwrap()
+    }
+}
+
+#[async_trait]
+impl PdMessage for pdpb::GetMembersRequest {
+    type Client = pdpb::pd_client::PdClient<Channel>;
+    type Response = pdpb::GetMembersResponse;
+    async fn rpc(req: Request<Self>, client: &mut Self::Client) -> GrpcResult<Self::Response> {
+        Ok(client.get_members(req).await?.into_inner())
+    }
+}
+impl PdResponse for pdpb::GetMembersResponse {
     fn header(&self) -> &pdpb::ResponseHeader {
         self.header.as_ref().unwrap()
     }

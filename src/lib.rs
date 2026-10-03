@@ -192,3 +192,6 @@ pub use crate::transaction::SchemaLeaseChecker;
 
 /// Local resource-group state derived from PD token responses.
 pub mod resource_group_runtime;
+
+/// Keyspace-independent PD metadata client for embedding applications.
+pub use pd::MetadataClient;
