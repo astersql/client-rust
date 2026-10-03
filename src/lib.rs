@@ -182,6 +182,8 @@ pub use crate::transaction::Transaction;
 #[doc(inline)]
 pub use crate::transaction::TransactionOptions;
 
+pub mod pool_task_details;
+pub use pool_task_details::PoolTaskDetails;
 pub mod read_options;
 pub use read_options::{PointResponseStats, ReadAttempt, ReadOptions, ReadStats};
 
