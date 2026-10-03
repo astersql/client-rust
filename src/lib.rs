@@ -189,3 +189,6 @@ pub use read_options::{PointResponseStats, ReadAttempt, ReadOptions, ReadStats};
 mod read_options_test;
 
 pub use crate::transaction::SchemaLeaseChecker;
+
+/// Local resource-group state derived from PD token responses.
+pub mod resource_group_runtime;
