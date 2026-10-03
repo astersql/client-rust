@@ -182,3 +182,221 @@ async fn ordinary_read_error_is_not_retried_as_a_timeout() {
     assert!(plan.execute().await.is_err());
     assert_eq!(client.calls.lock().unwrap().len(), 1);
 }
+
+#[test]
+fn read_pool_response_diagnostics_collect_get_batch_and_buffer_batch() {
+    let stats = crate::ReadStats::default();
+    let sample = kvrpcpb::PoolTaskDetails {
+        poll_count: 4,
+        dispatch_count: 2,
+        total_wall_nanos: 20_000_000,
+        total_queue_wait_nanos: 6_000_000,
+        max_queue_wait_nanos: 4_000_000,
+        min_queue_wait_nanos: 2_000_000,
+        total_wake_wait_nanos: 4_000_000,
+        max_wake_wait_nanos: 4_000_000,
+        min_wake_wait_nanos: 4_000_000,
+        fair_queue_enabled: true,
+        total_fair_queue_waited_task_slices: 6,
+        max_fair_queue_waited_task_slices: 4,
+        min_fair_queue_waited_task_slices: 2,
+        poll_cpu_nanos: 8_000_000,
+        max_poll_cpu_nanos: 3_000_000,
+        min_poll_cpu_nanos: 1_000_000,
+        poll_wall_nanos: 12_000_000,
+        max_poll_wall_nanos: 5_000_000,
+        min_poll_wall_nanos: 2_000_000,
+    };
+    let exec = Some(kvrpcpb::ExecDetailsV2 {
+        read_pool_task_details: Some(sample),
+        ..Default::default()
+    });
+    for response in [
+        Box::new(kvrpcpb::GetResponse {
+            exec_details_v2: exec.clone(),
+            ..Default::default()
+        }) as Box<dyn Any>,
+        Box::new(kvrpcpb::BatchGetResponse {
+            exec_details_v2: exec.clone(),
+            ..Default::default()
+        }),
+        Box::new(kvrpcpb::BufferBatchGetResponse {
+            exec_details_v2: exec.clone(),
+            ..Default::default()
+        }),
+    ] {
+        stats.record_response(response.as_ref());
+    }
+    let pool = stats.read_pool_task_details();
+    assert_eq!(
+        (
+            pool.task_count,
+            pool.poll_count,
+            pool.max_poll_count,
+            pool.min_poll_count
+        ),
+        (3, 12, 4, 4)
+    );
+    assert_eq!(
+        (
+            pool.dispatch_count,
+            pool.max_dispatch_count,
+            pool.min_dispatch_count
+        ),
+        (6, 2, 2)
+    );
+    assert_eq!(
+        (
+            pool.total_wall_time,
+            pool.max_task_wall_time,
+            pool.min_task_wall_time
+        ),
+        (
+            Duration::from_millis(60),
+            Duration::from_millis(20),
+            Duration::from_millis(20)
+        )
+    );
+    assert_eq!(pool.task_wall_time_sample_count, 3);
+    assert_eq!(
+        (
+            pool.total_queue_wait_time,
+            pool.max_queue_wait_time,
+            pool.min_queue_wait_time
+        ),
+        (
+            Duration::from_millis(18),
+            Duration::from_millis(4),
+            Duration::from_millis(2)
+        )
+    );
+    assert_eq!(
+        (
+            pool.total_wake_wait_time,
+            pool.max_wake_wait_time,
+            pool.min_wake_wait_time
+        ),
+        (
+            Duration::from_millis(12),
+            Duration::from_millis(4),
+            Duration::from_millis(4)
+        )
+    );
+    assert_eq!(
+        (
+            pool.fair_queue_sample_count,
+            pool.total_fair_queue_waited_task_slices,
+            pool.max_fair_queue_waited_task_slices,
+            pool.min_fair_queue_waited_task_slices
+        ),
+        (6, 18, 4, 2)
+    );
+    assert_eq!(
+        (
+            pool.poll_cpu_time,
+            pool.max_poll_cpu_time,
+            pool.min_poll_cpu_time
+        ),
+        (
+            Duration::from_millis(24),
+            Duration::from_millis(3),
+            Duration::from_millis(1)
+        )
+    );
+    assert_eq!(
+        (
+            pool.poll_wall_time,
+            pool.max_poll_wall_time,
+            pool.min_poll_wall_time
+        ),
+        (
+            Duration::from_millis(36),
+            Duration::from_millis(5),
+            Duration::from_millis(2)
+        )
+    );
+    stats.record_response(&kvrpcpb::GetResponse::default());
+    stats.record_response(&kvrpcpb::GetResponse {
+        region_error: Some(Default::default()),
+        exec_details_v2: exec,
+        ..Default::default()
+    });
+    assert_eq!(stats.read_pool_task_details(), pool);
+}
+
+#[test]
+fn read_pool_zero_samples_preserve_observed_minima() {
+    let mut aggregate = crate::PoolTaskDetails::default();
+    aggregate.merge_from_pb(&kvrpcpb::PoolTaskDetails {
+        poll_count: 2,
+        dispatch_count: 3,
+        total_wall_nanos: 20,
+        total_queue_wait_nanos: 10,
+        min_queue_wait_nanos: 2,
+        max_queue_wait_nanos: 8,
+        total_wake_wait_nanos: 6,
+        min_wake_wait_nanos: 2,
+        max_wake_wait_nanos: 4,
+        fair_queue_enabled: true,
+        total_fair_queue_waited_task_slices: 6,
+        min_fair_queue_waited_task_slices: 2,
+        max_fair_queue_waited_task_slices: 4,
+        poll_cpu_nanos: 5,
+        min_poll_cpu_nanos: 2,
+        max_poll_cpu_nanos: 3,
+        poll_wall_nanos: 9,
+        min_poll_wall_nanos: 4,
+        max_poll_wall_nanos: 5,
+    });
+    aggregate.merge_from_pb(&Default::default());
+    assert_eq!(
+        (
+            aggregate.task_count,
+            aggregate.min_poll_count,
+            aggregate.min_dispatch_count
+        ),
+        (2, 0, 0)
+    );
+    assert_eq!(aggregate.min_task_wall_time, Duration::from_nanos(20));
+    assert_eq!(aggregate.min_queue_wait_time, Duration::from_nanos(2));
+    assert_eq!(aggregate.min_wake_wait_time, Duration::from_nanos(2));
+    assert_eq!(aggregate.min_poll_cpu_time, Duration::from_nanos(2));
+    assert_eq!(aggregate.min_poll_wall_time, Duration::from_nanos(4));
+    assert_eq!(aggregate.min_fair_queue_waited_task_slices, 2);
+}
+
+#[test]
+fn read_pool_parallel_response_samples_and_snapshots_are_independent() {
+    let stats = Arc::new(crate::ReadStats::default());
+    let workers = (0..16)
+        .map(|_| {
+            let stats = stats.clone();
+            std::thread::spawn(move || {
+                stats.record_response(&kvrpcpb::GetResponse {
+                    exec_details_v2: Some(kvrpcpb::ExecDetailsV2 {
+                        read_pool_task_details: Some(kvrpcpb::PoolTaskDetails {
+                            poll_count: 2,
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                })
+            })
+        })
+        .collect::<Vec<_>>();
+    for worker in workers {
+        worker.join().unwrap();
+    }
+    let snapshot = stats.read_pool_task_details();
+    assert_eq!((snapshot.task_count, snapshot.poll_count), (16, 32));
+    stats.record_response(&kvrpcpb::GetResponse {
+        exec_details_v2: Some(kvrpcpb::ExecDetailsV2 {
+            read_pool_task_details: Some(kvrpcpb::PoolTaskDetails::default()),
+            ..Default::default()
+        }),
+        ..Default::default()
+    });
+    assert_eq!(snapshot.task_count, 16);
+    assert_eq!(stats.read_pool_task_details().task_count, 17);
+}

@@ -41,9 +41,15 @@ pub struct ReadAttempt {
 pub struct ReadStats {
     attempts: Mutex<Vec<ReadAttempt>>,
     point_responses: Mutex<PointResponseStats>,
+    read_pool: Mutex<crate::PoolTaskDetails>,
 }
 
 impl ReadStats {
+    /// Clone the completed read-pool response aggregate.
+    pub fn read_pool_task_details(&self) -> crate::PoolTaskDetails {
+        self.read_pool.lock().unwrap().clone()
+    }
+
     pub fn point_response_stats(&self) -> PointResponseStats {
         *self.point_responses.lock().unwrap()
     }
@@ -59,6 +65,7 @@ impl ReadStats {
             } else {
                 0
             };
+            self.record_read_pool(r.exec_details_v2.as_ref());
             stats.record_response(
                 r.exec_details_v2
                     .as_ref()
@@ -78,6 +85,7 @@ impl ReadStats {
             } else {
                 0
             };
+            self.record_read_pool(r.exec_details_v2.as_ref());
             stats.record_response(
                 r.exec_details_v2
                     .as_ref()
@@ -97,12 +105,19 @@ impl ReadStats {
             } else {
                 0
             };
+            self.record_read_pool(r.exec_details_v2.as_ref());
             stats.record_response(
                 r.exec_details_v2
                     .as_ref()
                     .and_then(|d| d.scan_detail_v2.as_ref()),
                 bytes,
             );
+        }
+    }
+
+    fn record_read_pool(&self, details: Option<&kvrpcpb::ExecDetailsV2>) {
+        if let Some(pool) = details.and_then(|details| details.read_pool_task_details.as_ref()) {
+            self.read_pool.lock().unwrap().merge_from_pb(pool);
         }
     }
 
