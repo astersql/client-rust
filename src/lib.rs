@@ -192,6 +192,8 @@ mod read_options_test;
 
 pub use crate::transaction::SchemaLeaseChecker;
 
+pub mod resource_group_lookup;
+pub mod resource_group_provider;
 /// Local resource-group state derived from PD token responses.
 pub mod resource_group_runtime;
 
