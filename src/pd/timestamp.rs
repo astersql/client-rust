@@ -95,6 +95,7 @@ async fn run_tso(
     };
 
     // let send_requests = rpc_sender.send_all(&mut request_stream);
+    crate::rpc_interceptor::before_pd("/pdpb.PD/Tso")?;
     let mut responses = pd_client.tso(request_stream).await?.into_inner();
 
     while let Some(Ok(resp)) = responses.next().await {

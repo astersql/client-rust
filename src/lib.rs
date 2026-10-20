@@ -110,6 +110,9 @@ pub mod proto;
 mod region;
 mod region_cache;
 pub mod rpc_interceptor;
+#[cfg(test)]
+#[path = "rpc_interceptor_test.rs"]
+mod rpc_interceptor_test;
 mod stats;
 mod store;
 mod timestamp;

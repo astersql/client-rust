@@ -8,6 +8,11 @@ use std::sync::{Arc, LazyLock, RwLock};
 use std::time::Duration;
 
 pub trait RpcInterceptor: Send + Sync + 'static {
+    /// Runs before a PD RPC is sent. The method name uses the canonical gRPC
+    /// path so callers can apply the same allowlists as other TiDB clients.
+    fn before_pd(&self, _method: &str) -> Result<()> {
+        Ok(())
+    }
     fn before(&self, _request: &dyn Any, _timeout: &mut Duration) -> Result<()> {
         Ok(())
     }
@@ -54,6 +59,12 @@ pub(crate) fn snapshot() -> Vec<Arc<dyn RpcInterceptor>> {
         .iter()
         .map(|(_, hook)| Arc::clone(hook))
         .collect()
+}
+pub(crate) fn before_pd(method: &str) -> Result<()> {
+    for hook in snapshot() {
+        hook.before_pd(method)?;
+    }
+    Ok(())
 }
 pub(crate) fn prewrite_batch_size(start_ts: u64, default: u64) -> u64 {
     snapshot()
