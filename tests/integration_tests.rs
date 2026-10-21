@@ -59,6 +59,34 @@ async fn txn_get_timestamp() -> Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+#[serial]
+async fn txn_snapshot_get_with_commit_ts() -> Result<()> {
+    init().await?;
+    let client =
+        TransactionClient::new_with_config(pd_addrs(), Config::default().with_default_keyspace())
+            .await?;
+    let mut txn = client.begin_optimistic().await?;
+    txn.put("snapshot_commit_ts".to_owned(), "value".to_owned())
+        .await?;
+    txn.commit().await?;
+    let mut snapshot = client.snapshot(
+        client.current_timestamp().await?,
+        TransactionOptions::new_optimistic(),
+    );
+    let (value, commit_ts) = snapshot
+        .get_with_commit_ts("snapshot_commit_ts".to_owned())
+        .await?
+        .expect("committed value");
+    assert_eq!(value, b"value");
+    assert!(commit_ts > 0);
+    assert!(snapshot
+        .get_with_commit_ts("absent_commit_ts".to_owned())
+        .await?
+        .is_none());
+    Ok(())
+}
+
 // Tests transactional get, put, delete, batch_get
 #[tokio::test]
 #[serial]

@@ -1,3 +1,4 @@
+// Copyright 2026 AsterSQL.
 // Copyright 2020 TiKV Project Authors. Licensed under Apache-2.0.
 
 //! A utility module for managing and retrying PD requests.
@@ -123,6 +124,12 @@ macro_rules! retry {
 }
 
 impl RetryClient<Cluster> {
+    pub async fn get_members(&self) -> Result<pdpb::GetMembersResponse> {
+        retry_mut!(self, "get_members", |cluster| async {
+            cluster.get_members(self.timeout).await
+        })
+    }
+
     pub async fn connect(
         endpoints: &[String],
         security_mgr: Arc<SecurityManager>,

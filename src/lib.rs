@@ -1,3 +1,4 @@
+// Copyright 2026 AsterSQL.
 // Copyright 2018 TiKV Project Authors. Licensed under Apache-2.0.
 
 //! This crate provides an easy-to-use client for [TiKV](https://github.com/tikv/tikv), a
@@ -105,9 +106,13 @@ mod compat;
 mod config;
 mod kv;
 mod pd;
-mod proto;
+pub mod proto;
 mod region;
 mod region_cache;
+pub mod rpc_interceptor;
+#[cfg(test)]
+#[path = "rpc_interceptor_test.rs"]
+mod rpc_interceptor_test;
 mod stats;
 mod store;
 mod timestamp;
@@ -144,6 +149,8 @@ pub use crate::kv::KvPair;
 #[doc(inline)]
 pub use crate::kv::Value;
 #[doc(inline)]
+pub use crate::proto::kvrpcpb::DiskFullOpt;
+#[doc(inline)]
 pub use crate::raw::lowering as raw_lowering;
 #[doc(inline)]
 pub use crate::raw::Client as RawClient;
@@ -177,3 +184,21 @@ pub use crate::transaction::SyncTransactionClient;
 pub use crate::transaction::Transaction;
 #[doc(inline)]
 pub use crate::transaction::TransactionOptions;
+
+pub mod pool_task_details;
+pub use pool_task_details::PoolTaskDetails;
+pub mod read_options;
+pub use read_options::{PointResponseStats, ReadAttempt, ReadOptions, ReadStats};
+
+#[cfg(test)]
+mod read_options_test;
+
+pub use crate::transaction::SchemaLeaseChecker;
+
+pub mod resource_group_lookup;
+pub mod resource_group_provider;
+/// Local resource-group state derived from PD token responses.
+pub mod resource_group_runtime;
+
+/// Keyspace-independent PD metadata client for embedding applications.
+pub use pd::MetadataClient;

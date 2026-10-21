@@ -17,10 +17,12 @@ pub use sync_client::SyncTransactionClient;
 pub use sync_snapshot::SyncSnapshot;
 pub use sync_transaction::SyncTransaction;
 pub use transaction::CheckLevel;
+pub use transaction::FairLockDetails;
 #[doc(hidden)]
 pub use transaction::HeartbeatOption;
 pub use transaction::Mutation;
 pub use transaction::Scanner;
+pub use transaction::SchemaLeaseChecker;
 pub use transaction::Transaction;
 pub use transaction::TransactionOptions;
 
@@ -33,9 +35,14 @@ pub(crate) use lock::reject_shared_locks;
 pub use lock::LockResolver;
 pub use lock::ResolveLocksContext;
 pub use lock::ResolveLocksOptions;
+#[cfg(test)]
+mod disk_full_opt_test;
 mod snapshot;
 mod sync_client;
 mod sync_snapshot;
 mod sync_transaction;
 #[allow(clippy::module_inception)]
 mod transaction;
+
+#[cfg(test)]
+mod schema_lease_checker_test;

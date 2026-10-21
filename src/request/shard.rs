@@ -1,3 +1,4 @@
+// Copyright 2026 AsterSQL.
 // Copyright 2021 TiKV Project Authors. Licensed under Apache-2.0.
 
 use std::sync::Arc;
@@ -120,6 +121,7 @@ impl<Req: KvRequest + Shardable> Shardable for Dispatch<Req> {
         Dispatch {
             request: self.request.clone_then_apply_shard(shard),
             kv_client: self.kv_client.clone(),
+            read_options: self.read_options.clone(),
         }
     }
 
@@ -318,7 +320,7 @@ mod test {
         let mut rng = thread_rng();
 
         let items: Vec<_> = (0..3)
-            .map(|_| (0..2).map(|_| rng.gen::<u8>()).collect::<Vec<_>>())
+            .map(|_| (0..2).map(|_| rng.r#gen::<u8>()).collect::<Vec<_>>())
             .collect();
 
         let batch_size = 5;
@@ -338,7 +340,7 @@ mod test {
         let mut rng = thread_rng();
 
         let items: Vec<_> = (0..3)
-            .map(|_| (0..3).map(|_| rng.gen::<u8>()).collect::<Vec<_>>())
+            .map(|_| (0..3).map(|_| rng.r#gen::<u8>()).collect::<Vec<_>>())
             .collect();
 
         let batch_size = 2;

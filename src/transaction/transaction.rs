@@ -1,3 +1,4 @@
+// Copyright 2026 AsterSQL.
 // Copyright 2019 TiKV Project Authors. Licensed under Apache-2.0.
 
 use std::iter;
@@ -14,25 +15,31 @@ use tokio::time::Duration;
 
 use crate::backoff::Backoff;
 use crate::backoff::DEFAULT_REGION_BACKOFF;
+use crate::internal_err;
 use crate::pd::PdClient;
 use crate::pd::PdRpcClient;
 use crate::proto::kvrpcpb;
+use crate::proto::kvrpcpb::DiskFullOpt;
 use crate::proto::pdpb::Timestamp;
 use crate::request::Collect;
 use crate::request::CollectError;
 use crate::request::CollectSingle;
-use crate::request::CollectWithShard;
+use crate::request::DefaultProcessor;
 use crate::request::EncodeKeyspace;
 use crate::request::KeyMode;
 use crate::request::Keyspace;
 use crate::request::Plan;
 use crate::request::PlanBuilder;
+use crate::request::Process;
 use crate::request::RetryOptions;
 use crate::request::TruncateKeyspace;
 use crate::timestamp::TimestampExt;
 use crate::transaction::buffer::Buffer;
-use crate::transaction::lock::format_key_for_log;
+use crate::transaction::lock::{
+    contains_shared_locks, format_key_for_log, shared_locks_contain_transaction,
+};
 use crate::transaction::lowering::*;
+use crate::transaction::requests::CollectPessimisticLockWithShard;
 use crate::BoundRange;
 use crate::Error;
 use crate::Key;
@@ -81,6 +88,53 @@ pub use scanner::Scanner;
 /// txn.commit().await.unwrap();
 /// # });
 /// ```
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct FairLockDetails {
+    pub aggressive_lock_new_count: usize,
+    pub aggressive_lock_derived_count: usize,
+    pub locked_with_conflict_count: usize,
+}
+
+impl FairLockDetails {
+    pub fn from_key_results(
+        results: &[kvrpcpb::PessimisticLockKeyResult],
+        sent_keys: usize,
+        fair_locking: bool,
+    ) -> Self {
+        if !fair_locking {
+            return Self::default();
+        }
+        if results.is_empty() {
+            return Self {
+                aggressive_lock_new_count: sent_keys,
+                ..Self::default()
+            };
+        }
+        let mut details = Self::default();
+        for result in results {
+            match kvrpcpb::PessimisticLockKeyResultType::try_from(result.r#type) {
+                Ok(kvrpcpb::PessimisticLockKeyResultType::LockResultNormal) => {
+                    details.aggressive_lock_new_count += 1;
+                }
+                Ok(kvrpcpb::PessimisticLockKeyResultType::LockResultLockedWithConflict) => {
+                    details.aggressive_lock_new_count += 1;
+                    if result.locked_with_conflict_ts != 0 {
+                        details.locked_with_conflict_count += 1;
+                    }
+                }
+                Ok(kvrpcpb::PessimisticLockKeyResultType::LockResultFailed) | Err(_) => {}
+            }
+        }
+        details
+    }
+
+    pub fn merge(&mut self, other: Self) {
+        self.aggressive_lock_new_count += other.aggressive_lock_new_count;
+        self.aggressive_lock_derived_count += other.aggressive_lock_derived_count;
+        self.locked_with_conflict_count += other.locked_with_conflict_count;
+    }
+}
+
 pub struct Transaction<PdC: PdClient = PdRpcClient> {
     status: Arc<AtomicU8>,
     timestamp: Timestamp,
@@ -94,10 +148,50 @@ pub struct Transaction<PdC: PdClient = PdRpcClient> {
     /// transitions to `StartedRollback` on rollback, losing the fact that commit
     /// had started — which a rollback retry would otherwise need to know.
     prewritten: bool,
+    lock_wait_timeout_ms: i64,
+    lock_shared_mode: bool,
+    fair_locking: bool,
+    fair_locked_keys: std::collections::HashSet<Vec<u8>>,
+    fair_retry_keys: std::collections::HashSet<Vec<u8>>,
+    statement_stages: Vec<(i32, Buffer, std::collections::HashSet<Vec<u8>>)>,
+    next_statement_stage: i32,
     start_instant: Instant,
 }
 
+/// Caller-supplied schema validation with the transaction's captured schema context.
+#[derive(Clone)]
+pub struct SchemaLeaseChecker(Arc<dyn Fn(u64) -> Result<()> + Send + Sync>);
+impl SchemaLeaseChecker {
+    pub fn new(check: impl Fn(u64) -> Result<()> + Send + Sync + 'static) -> Self {
+        Self(Arc::new(check))
+    }
+    fn check(&self, timestamp: u64) -> Result<()> {
+        (self.0)(timestamp)
+    }
+}
+impl std::fmt::Debug for SchemaLeaseChecker {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SchemaLeaseChecker")
+    }
+}
+impl PartialEq for SchemaLeaseChecker {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
 impl<PdC: PdClient> Transaction<PdC> {
+    /// Set the server-enforced window for async commit and 1PC (Go defaults to 2s).
+    pub fn set_schema_safe_window(&mut self, window: Duration) {
+        self.options.schema_safe_window = window;
+    }
+    pub fn set_schema_lease_checker(&mut self, checker: Option<SchemaLeaseChecker>) {
+        self.options.schema_lease_checker = checker;
+    }
+    pub fn set_read_options(&mut self, options: Option<crate::ReadOptions>) {
+        self.options.read_options = options;
+    }
+
     pub(crate) fn new(
         timestamp: Timestamp,
         rpc: Arc<PdC>,
@@ -118,8 +212,39 @@ impl<PdC: PdClient> Transaction<PdC> {
             keyspace,
             is_heartbeat_started: false,
             prewritten: false,
+            lock_wait_timeout_ms: 0,
+            lock_shared_mode: false,
+            fair_locking: false,
+            fair_locked_keys: Default::default(),
+            fair_retry_keys: Default::default(),
+            statement_stages: Vec::new(),
+            next_statement_stage: 0,
             start_instant: std::time::Instant::now(),
         }
+    }
+
+    /// Apply TiDB transaction options before staging mutations.
+    pub fn set_async_commit(&mut self, enabled: bool) {
+        self.options.async_commit = enabled;
+    }
+    pub fn set_one_pc(&mut self, enabled: bool) {
+        self.options.try_one_pc = enabled;
+    }
+    pub fn set_pessimistic(&mut self, enabled: bool) {
+        self.options.kind = if enabled {
+            TransactionKind::Pessimistic(self.timestamp.clone())
+        } else {
+            TransactionKind::Optimistic
+        };
+        self.buffer.set_pessimistic(enabled);
+    }
+
+    /// Sets whether writes may proceed at each TiKV disk usage level.
+    ///
+    /// The option is attached to prewrite and commit requests, matching
+    /// client-go's `KVTxn.SetDiskFullOpt`.
+    pub fn set_disk_full_opt(&mut self, option: DiskFullOpt) {
+        self.options.disk_full_opt = option;
     }
 
     /// Create a new 'get' request
@@ -143,6 +268,7 @@ impl<PdC: PdClient> Transaction<PdC> {
     pub async fn get(&mut self, key: impl Into<Key>) -> Result<Option<Value>> {
         trace!("invoking transactional get request");
         self.check_allow_operation().await?;
+        let read_options = self.options.read_options.clone();
         let timestamp = self.timestamp.clone();
         let rpc = self.rpc.clone();
         let key = key.into().encode_keyspace(self.keyspace, KeyMode::Txn);
@@ -153,6 +279,7 @@ impl<PdC: PdClient> Transaction<PdC> {
             .get_or_else(key, |key| async move {
                 let request = new_get_request(key, timestamp.clone());
                 let plan = PlanBuilder::new(rpc, keyspace, request)
+                    .with_read_options(read_options)
                     .resolve_lock(timestamp, retry_options.lock_backoff, keyspace)
                     .retry_multi_region(DEFAULT_REGION_BACKOFF)
                     .merge(CollectSingle)
@@ -161,6 +288,34 @@ impl<PdC: PdClient> Transaction<PdC> {
                 plan.execute().await
             })
             .await
+    }
+
+    /// Read a committed value together with the visible version's commit timestamp.
+    /// This is used by MVCC maintenance jobs that must fence their deletions by
+    /// commit time. It reads from TiKV directly and should only be called on a
+    /// read-only snapshot, where no buffered writes can shadow the result.
+    pub(crate) async fn get_committed_with_commit_ts(
+        &mut self,
+        key: impl Into<Key>,
+    ) -> Result<Option<(Value, u64)>> {
+        self.check_allow_operation().await?;
+        let key = key.into().encode_keyspace(self.keyspace, KeyMode::Txn);
+        let mut request = new_get_request(key, self.timestamp.clone());
+        request.need_commit_ts = true;
+        let plan = PlanBuilder::new(self.rpc.clone(), self.keyspace, request)
+            .with_read_options(self.options.read_options.clone())
+            .resolve_lock(
+                self.timestamp.clone(),
+                self.options.retry_options.lock_backoff.clone(),
+                self.keyspace,
+            )
+            .retry_multi_region(DEFAULT_REGION_BACKOFF)
+            .merge(CollectSingle)
+            .plan();
+        let response = plan.execute().await?;
+        let commit_ts = response.commit_ts;
+        let value = DefaultProcessor.process(Ok(response))?;
+        Ok(value.map(|value| (value, commit_ts)))
     }
 
     /// Create a `get for update` request.
@@ -276,6 +431,7 @@ impl<PdC: PdClient> Transaction<PdC> {
     ) -> Result<impl Iterator<Item = KvPair>> {
         debug!("invoking transactional batch_get request");
         self.check_allow_operation().await?;
+        let read_options = self.options.read_options.clone();
         let timestamp = self.timestamp.clone();
         let rpc = self.rpc.clone();
         let keyspace = self.keyspace;
@@ -288,6 +444,7 @@ impl<PdC: PdClient> Transaction<PdC> {
             .batch_get_or_else(keys, move |keys| async move {
                 let request = new_batch_get_request(keys, timestamp.clone());
                 let plan = PlanBuilder::new(rpc, keyspace, request)
+                    .with_read_options(read_options)
                     .resolve_lock(timestamp, retry_options.lock_backoff, keyspace)
                     .retry_multi_region(retry_options.region_backoff)
                     .merge(Collect)
@@ -467,6 +624,73 @@ impl<PdC: PdClient> Transaction<PdC> {
     /// txn.commit().await.unwrap();
     /// # });
     /// ```
+    /// Stage a TiDB mem-buffer write; pessimistic locking is a separate LockKeys operation.
+    pub fn stage_statement(&mut self) -> i32 {
+        self.next_statement_stage += 1;
+        let handle = self.next_statement_stage;
+        self.statement_stages.push((
+            handle,
+            self.buffer.clone(),
+            self.options.pessimistic_keys.clone(),
+        ));
+        handle
+    }
+
+    pub fn release_statement(&mut self, handle: i32) -> Result<()> {
+        if self.statement_stages.last().map(|stage| stage.0) != Some(handle) {
+            return Err(internal_err!(
+                "statement staging handle is not the active layer"
+            ));
+        }
+        self.statement_stages.pop();
+        Ok(())
+    }
+
+    pub async fn cleanup_statement(&mut self, handle: i32) -> Result<()> {
+        let Some((_, buffer, locked_before)) = self.statement_stages.last().cloned() else {
+            return Err(internal_err!("statement staging layer is missing"));
+        };
+        if self.statement_stages.last().map(|stage| stage.0) != Some(handle) {
+            return Err(internal_err!(
+                "statement staging handle is not the active layer"
+            ));
+        }
+        let new_locks = self
+            .options
+            .pessimistic_keys
+            .difference(&locked_before)
+            .cloned()
+            .map(Key::from)
+            .collect::<Vec<_>>();
+        if let TransactionKind::Pessimistic(for_update_ts) = self.options.kind.clone() {
+            self.pessimistic_lock_rollback(
+                new_locks.into_iter(),
+                self.timestamp.clone(),
+                for_update_ts,
+            )
+            .await?;
+        }
+        self.buffer = buffer;
+        self.options.pessimistic_keys = locked_before;
+        self.statement_stages.pop();
+        Ok(())
+    }
+
+    pub async fn stage_put(&mut self, key: impl Into<Key>, value: impl Into<Value>) -> Result<()> {
+        self.check_allow_operation().await?;
+        self.buffer.put(
+            key.into().encode_keyspace(self.keyspace, KeyMode::Txn),
+            value.into(),
+        );
+        Ok(())
+    }
+    pub async fn stage_delete(&mut self, key: impl Into<Key>) -> Result<()> {
+        self.check_allow_operation().await?;
+        self.buffer
+            .delete(key.into().encode_keyspace(self.keyspace, KeyMode::Txn));
+        Ok(())
+    }
+
     pub async fn put(&mut self, key: impl Into<Key>, value: impl Into<Value>) -> Result<()> {
         trace!("invoking transactional put request");
         self.check_allow_operation().await?;
@@ -616,6 +840,16 @@ impl<PdC: PdClient> Transaction<PdC> {
         &mut self,
         keys: impl IntoIterator<Item = impl Into<Key>>,
     ) -> Result<()> {
+        self.lock_keys_with_wait_timeout(keys, 0).await
+    }
+
+    /// Send the statement lock wait budget to TiKV. -1 requests NOWAIT;
+    /// positive values are milliseconds. TiKV owns timeout and lock cleanup.
+    pub async fn lock_keys_with_wait_timeout(
+        &mut self,
+        keys: impl IntoIterator<Item = impl Into<Key>>,
+        wait_timeout_ms: i64,
+    ) -> Result<()> {
         debug!("invoking transactional lock_keys request");
         self.check_allow_operation().await?;
         let keyspace = self.keyspace;
@@ -629,10 +863,80 @@ impl<PdC: PdClient> Transaction<PdC> {
                 }
             }
             TransactionKind::Pessimistic(_) => {
-                self.pessimistic_lock(keys, false).await?;
+                self.lock_wait_timeout_ms = wait_timeout_ms;
+                let result = self.pessimistic_lock(keys, false).await;
+                self.lock_wait_timeout_ms = 0;
+                result?;
             }
         }
         Ok(())
+    }
+
+    /// Lock keys and return counters derived from TiKV's per-key protobuf results.
+    pub async fn lock_keys_with_wait_timeout_and_details(
+        &mut self,
+        keys: impl IntoIterator<Item = impl Into<Key>>,
+        wait_timeout_ms: i64,
+    ) -> Result<FairLockDetails> {
+        debug!("invoking transactional lock_keys request with details");
+        self.check_allow_operation().await?;
+        let keyspace = self.keyspace;
+        let keys = keys
+            .into_iter()
+            .map(move |key| key.into().encode_keyspace(keyspace, KeyMode::Txn));
+        match self.options.kind {
+            TransactionKind::Optimistic => {
+                for key in keys {
+                    self.buffer.lock(key);
+                }
+                Ok(FairLockDetails::default())
+            }
+            TransactionKind::Pessimistic(_) => {
+                self.lock_wait_timeout_ms = wait_timeout_ms;
+                let result = self.pessimistic_lock_with_details(keys, false).await;
+                self.lock_wait_timeout_ms = 0;
+                result.map(|(_, details)| details)
+            }
+        }
+    }
+
+    pub fn start_fair_locking(&mut self) {
+        self.fair_locking = true;
+        self.fair_locked_keys.clear();
+        self.fair_retry_keys.clear();
+    }
+
+    pub fn retry_fair_locking(&mut self) {
+        self.fair_retry_keys.clone_from(&self.fair_locked_keys);
+        self.fair_locked_keys.clear();
+    }
+
+    pub fn cancel_fair_locking(&mut self) {
+        self.fair_locking = false;
+        self.fair_locked_keys.clear();
+        self.fair_retry_keys.clear();
+    }
+
+    pub fn done_fair_locking(&mut self) {
+        self.cancel_fair_locking();
+    }
+
+    pub fn is_in_fair_locking_mode(&self) -> bool {
+        self.fair_locking
+    }
+
+    /// Acquire server-side shared pessimistic locks for foreign-key checks.
+    pub async fn lock_shared_keys_with_wait_timeout(
+        &mut self,
+        keys: impl IntoIterator<Item = impl Into<Key>>,
+        wait_timeout_ms: i64,
+    ) -> Result<()> {
+        self.lock_shared_mode = true;
+        let result = self
+            .lock_keys_with_wait_timeout(keys, wait_timeout_ms)
+            .await;
+        self.lock_shared_mode = false;
+        result
     }
 
     /// Commits the actions of the transaction. On success, we return the commit timestamp (or
@@ -815,6 +1119,7 @@ impl<PdC: PdClient> Transaction<PdC> {
         reverse: bool,
     ) -> Result<impl Iterator<Item = KvPair>> {
         self.check_allow_operation().await?;
+        let read_options = self.options.read_options.clone();
         let timestamp = self.timestamp.clone();
         let rpc = self.rpc.clone();
         let retry_options = self.options.retry_options.clone();
@@ -836,6 +1141,7 @@ impl<PdC: PdClient> Transaction<PdC> {
                         reverse,
                     );
                     let plan = PlanBuilder::new(rpc, keyspace, request)
+                        .with_read_options(read_options)
                         .resolve_lock(timestamp, retry_options.lock_backoff, keyspace)
                         .retry_multi_region(retry_options.region_backoff)
                         .merge(Collect)
@@ -861,14 +1167,43 @@ impl<PdC: PdClient> Transaction<PdC> {
         keys: impl IntoIterator<Item = impl PessimisticLock>,
         need_value: bool,
     ) -> Result<Vec<KvPair>> {
+        self.pessimistic_lock_with_details(keys, need_value)
+            .await
+            .map(|(pairs, _)| pairs)
+    }
+
+    async fn pessimistic_lock_with_details(
+        &mut self,
+        keys: impl IntoIterator<Item = impl PessimisticLock>,
+        need_value: bool,
+    ) -> Result<(Vec<KvPair>, FairLockDetails)> {
         assert!(
             matches!(self.options.kind, TransactionKind::Pessimistic(_)),
             "`pessimistic_lock` is only valid to use with pessimistic transactions"
         );
 
-        let keys: Vec<_> = keys.into_iter().collect();
+        let all_keys: Vec<_> = keys.into_iter().collect();
+        let mut details = FairLockDetails::default();
+        let keys: Vec<_> = if self.fair_locking {
+            all_keys
+                .iter()
+                .filter(|key| {
+                    let raw = Vec::<u8>::from((*key).clone().key());
+                    if self.fair_retry_keys.remove(&raw) {
+                        details.aggressive_lock_derived_count += 1;
+                        self.fair_locked_keys.insert(raw);
+                        false
+                    } else {
+                        true
+                    }
+                })
+                .cloned()
+                .collect()
+        } else {
+            all_keys
+        };
         if keys.is_empty() {
-            return Ok(vec![]);
+            return Ok((vec![], details));
         }
         debug!(
             "acquiring pessimistic lock, start_ts: {}, keys: {}, need_value: {}",
@@ -884,58 +1219,117 @@ impl<PdC: PdClient> Transaction<PdC> {
             .buffer
             .get_primary_key()
             .unwrap_or_else(|| first_key.clone());
-        let for_update_ts = self.rpc.clone().get_timestamp().await?;
-        self.options.push_for_update_ts(for_update_ts.clone());
-        let request = new_pessimistic_lock_request(
-            keys.clone().into_iter(),
-            primary_lock,
-            self.timestamp.clone(),
-            MAX_TTL,
-            for_update_ts.clone(),
-            need_value,
-        );
-        let plan = PlanBuilder::new(self.rpc.clone(), self.keyspace, request)
-            .resolve_lock(
+        let mut retry_backoff = self.options.retry_options.lock_backoff.clone();
+        let lock_wait_started = Instant::now();
+        loop {
+            let request_wait_timeout_ms = remaining_lock_wait_timeout_ms(
+                self.lock_wait_timeout_ms,
+                lock_wait_started.elapsed(),
+            );
+            let for_update_ts = self.rpc.clone().get_timestamp().await?;
+            self.options.push_for_update_ts(for_update_ts.clone());
+            let mut request = new_pessimistic_lock_request(
+                keys.clone().into_iter(),
+                primary_lock.clone(),
                 self.timestamp.clone(),
-                self.options.retry_options.lock_backoff.clone(),
-                self.keyspace,
-            )
-            .preserve_shard()
-            .retry_multi_region_preserve_results(self.options.retry_options.region_backoff.clone())
-            .merge(CollectWithShard)
-            .plan();
-        let pairs = plan.execute().await;
-
-        if let Err(err) = pairs {
-            match err {
-                Error::PessimisticLockError {
-                    inner,
-                    success_keys,
-                } if !success_keys.is_empty() => {
-                    debug!(
-                        "pessimistic lock failed, rolling back {} partially-acquired lock(s), start_ts: {}, for_update_ts: {}",
-                        success_keys.len(),
-                        self.timestamp.version(),
-                        for_update_ts.version(),
-                    );
-                    let keys = success_keys.into_iter().map(Key::from);
-                    self.pessimistic_lock_rollback(keys, self.timestamp.clone(), for_update_ts)
-                        .await?;
-                    Err(*inner)
-                }
-                _ => Err(err),
+                MAX_TTL,
+                for_update_ts.clone(),
+                need_value,
+                request_wait_timeout_ms,
+                self.lock_shared_mode,
+            );
+            if self.fair_locking && keys.len() == 1 {
+                request.wake_up_mode =
+                    kvrpcpb::PessimisticLockWakeUpMode::WakeUpModeForceLock.into();
             }
-        } else {
+            let resolve_backoff = pessimistic_lock_resolve_backoff(
+                request_wait_timeout_ms,
+                self.options.retry_options.lock_backoff.clone(),
+            );
+            let plan = PlanBuilder::new(self.rpc.clone(), self.keyspace, request)
+                .resolve_lock(self.timestamp.clone(), resolve_backoff, self.keyspace)
+                .preserve_shard()
+                .retry_multi_region_preserve_results(
+                    self.options.retry_options.region_backoff.clone(),
+                )
+                .merge(CollectPessimisticLockWithShard)
+                .plan();
+            let (pairs, key_results) = match plan.execute().await {
+                Err(err) => {
+                    let (shared_conflict, owns_shared_lock) =
+                        shared_lock_conflict_info(&err, self.timestamp.version());
+                    if self.lock_wait_timeout_ms >= 0 && owns_shared_lock {
+                        self.pessimistic_lock_rollback(
+                            keys.iter().cloned().map(PessimisticLock::key),
+                            self.timestamp.clone(),
+                            for_update_ts,
+                        )
+                        .await?;
+                        continue;
+                    }
+                    if self.lock_wait_timeout_ms > 0
+                        && (shared_conflict || is_pessimistic_retry(&err))
+                    {
+                        let budget = Duration::from_millis(self.lock_wait_timeout_ms as u64);
+                        if lock_wait_started.elapsed() < budget {
+                            if let Some(delay) = retry_backoff.next_delay_duration() {
+                                tokio::time::sleep(
+                                    delay.min(budget.saturating_sub(lock_wait_started.elapsed())),
+                                )
+                                .await;
+                                continue;
+                            }
+                        }
+                    }
+                    let err = match err {
+                        Error::PessimisticLockError {
+                            inner,
+                            success_keys,
+                        } => {
+                            if !success_keys.is_empty() {
+                                self.pessimistic_lock_rollback(
+                                    success_keys.into_iter().map(Key::from),
+                                    self.timestamp.clone(),
+                                    for_update_ts,
+                                )
+                                .await?;
+                            }
+                            *inner
+                        }
+                        err => err,
+                    };
+                    if should_retry_pessimistic_lock(self.lock_wait_timeout_ms, &err) {
+                        if let Some(delay) = retry_backoff.next_delay_duration() {
+                            tokio::time::sleep(delay).await;
+                            continue;
+                        }
+                    }
+                    return Err(err);
+                }
+                Ok(result) => result,
+            };
             // primary key will be set here if needed
             self.buffer.primary_key_or(&first_key);
 
             self.start_auto_heartbeat().await;
 
+            details.merge(FairLockDetails::from_key_results(
+                &key_results,
+                keys.len(),
+                self.fair_locking,
+            ));
             for key in keys {
-                self.buffer.lock(key.key());
+                let key = key.key();
+                if self.fair_locking {
+                    self.fair_locked_keys.insert(Vec::<u8>::from(key.clone()));
+                }
+                self.options
+                    .pessimistic_keys
+                    .insert(Vec::<u8>::from(key.clone()));
+                self.buffer.lock(key);
             }
 
-            pairs
+            return Ok((pairs, details));
         }
     }
 
@@ -996,7 +1390,10 @@ impl<PdC: PdClient> Transaction<PdC> {
     }
 
     async fn start_auto_heartbeat(&mut self) {
-        if !self.options.heartbeat_option.is_auto_heartbeat() || self.is_heartbeat_started {
+        if crate::rpc_interceptor::disable_heartbeat(self.timestamp.version())
+            || !self.options.heartbeat_option.is_auto_heartbeat()
+            || self.is_heartbeat_started
+        {
             return;
         }
         self.is_heartbeat_started = true;
@@ -1106,15 +1503,21 @@ impl<PdC: PdClient> Drop for Transaction<PdC> {
             let start_ts = self.timestamp.version();
             match self.options.check_level {
                 CheckLevel::Panic => {
-                    panic!("dropping an active transaction (start_ts: {start_ts}). Consider commit or rollback it.")
+                    panic!(
+                        "dropping an active transaction (start_ts: {start_ts}). Consider commit or rollback it."
+                    )
                 }
                 CheckLevel::Warn => {
-                    warn!("dropping an active transaction, start_ts: {start_ts}. Consider commit or rollback it.")
+                    warn!(
+                        "dropping an active transaction, start_ts: {start_ts}. Consider commit or rollback it."
+                    )
                 }
                 // Even with the drop check disabled, leave a debug breadcrumb so
                 // an unfinished transaction is not completely silent.
                 CheckLevel::None => {
-                    debug!("dropping an active transaction (drop check disabled), start_ts: {start_ts}")
+                    debug!(
+                        "dropping an active transaction (drop check disabled), start_ts: {start_ts}"
+                    )
                 }
             }
         }
@@ -1146,6 +1549,10 @@ pub enum TransactionKind {
 /// `TransactionOptions` has a builder-style API.
 #[derive(Clone, PartialEq, Debug)]
 pub struct TransactionOptions {
+    schema_lease_checker: Option<SchemaLeaseChecker>,
+    schema_safe_window: Duration,
+    pessimistic_keys: std::collections::HashSet<Vec<u8>>,
+    pub(crate) read_options: Option<crate::ReadOptions>,
     /// Optimistic or pessimistic (default) transaction.
     kind: TransactionKind,
     /// Try using 1pc rather than 2pc (default is to always use 2pc).
@@ -1158,6 +1565,8 @@ pub struct TransactionOptions {
     retry_options: RetryOptions,
     /// What to do if the transaction is dropped without an attempt to commit or rollback
     check_level: CheckLevel,
+    /// Whether writes may proceed at each TiKV disk usage level.
+    disk_full_opt: DiskFullOpt,
     #[doc(hidden)]
     heartbeat_option: HeartbeatOption,
 }
@@ -1178,12 +1587,17 @@ impl TransactionOptions {
     /// Default options for an optimistic transaction.
     pub fn new_optimistic() -> TransactionOptions {
         TransactionOptions {
+            schema_lease_checker: None,
+            schema_safe_window: Duration::from_secs(2),
+            pessimistic_keys: Default::default(),
+            read_options: None,
             kind: TransactionKind::Optimistic,
             try_one_pc: false,
             async_commit: false,
             read_only: false,
             retry_options: RetryOptions::default_optimistic(),
             check_level: CheckLevel::Panic,
+            disk_full_opt: DiskFullOpt::NotAllowedOnFull,
             heartbeat_option: HeartbeatOption::FixedTime(DEFAULT_HEARTBEAT_INTERVAL),
         }
     }
@@ -1191,12 +1605,17 @@ impl TransactionOptions {
     /// Default options for a pessimistic transaction.
     pub fn new_pessimistic() -> TransactionOptions {
         TransactionOptions {
+            schema_lease_checker: None,
+            schema_safe_window: Duration::from_secs(2),
+            pessimistic_keys: Default::default(),
+            read_options: None,
             kind: TransactionKind::Pessimistic(Timestamp::from_version(0)),
             try_one_pc: false,
             async_commit: false,
             read_only: false,
             retry_options: RetryOptions::default_pessimistic(),
             check_level: CheckLevel::Panic,
+            disk_full_opt: DiskFullOpt::NotAllowedOnFull,
             heartbeat_option: HeartbeatOption::FixedTime(DEFAULT_HEARTBEAT_INTERVAL),
         }
     }
@@ -1384,7 +1803,6 @@ impl<PdC: PdClient> Committer<PdC> {
         }
 
         let commit_ts = if self.options.async_commit {
-            // FIXME: min_commit_ts == 0 => fallback to normal 2PC
             min_commit_ts.unwrap()
         } else {
             match self.commit_primary_with_retry().await {
@@ -1414,7 +1832,10 @@ impl<PdC: PdClient> Committer<PdC> {
         );
         let primary_lock = self.primary_key.clone().unwrap();
         let elapsed = self.start_instant.elapsed().as_millis() as u64;
-        let lock_ttl = self.calc_txn_lock_ttl();
+        let lock_ttl = crate::rpc_interceptor::lock_ttl(
+            self.start_version.version(),
+            self.calc_txn_lock_ttl(),
+        );
         let mut request = match &self.options.kind {
             TransactionKind::Optimistic => new_prewrite_request(
                 self.mutations.clone(),
@@ -1431,6 +1852,23 @@ impl<PdC: PdClient> Committer<PdC> {
             ),
         };
 
+        request
+            .context
+            .get_or_insert_with(kvrpcpb::Context::default)
+            .disk_full_opt = self.options.disk_full_opt as i32;
+        if self.options.is_pessimistic() {
+            request.pessimistic_actions = request
+                .mutations
+                .iter()
+                .map(|mutation| {
+                    if self.options.pessimistic_keys.contains(&mutation.key) {
+                        kvrpcpb::prewrite_request::PessimisticAction::DoPessimisticCheck as i32
+                    } else {
+                        kvrpcpb::prewrite_request::PessimisticAction::DoConstraintCheck as i32
+                    }
+                })
+                .collect();
+        }
         request.use_async_commit = self.options.async_commit;
         request.try_one_pc = self.options.try_one_pc;
         request.secondaries = self
@@ -1439,7 +1877,34 @@ impl<PdC: PdClient> Committer<PdC> {
             .filter(|m| self.primary_key.as_ref().unwrap() != m.key.as_ref())
             .map(|m| m.key.clone())
             .collect();
-        // FIXME set max_commit_ts and min_commit_ts
+        // Async commit and 1PC can become durable during prewrite. Validate
+        // before that RPC, then let TiKV enforce Go's maximum commit timestamp.
+        // A server fallback to 2PC is checked again at its actual commit TS.
+        if self.options.async_commit || self.options.try_one_pc {
+            let elapsed_ms = u64::try_from(self.start_instant.elapsed().as_millis())
+                .map_err(|_| Error::StringError("transaction elapsed time overflow".into()))?;
+            let current_ts = self
+                .start_version
+                .version()
+                .checked_add(
+                    elapsed_ms
+                        .checked_mul(1 << 18)
+                        .ok_or_else(|| Error::StringError("schema timestamp overflow".into()))?,
+                )
+                .ok_or_else(|| Error::StringError("schema timestamp overflow".into()))?;
+            if let Some(checker) = &self.options.schema_lease_checker {
+                checker.check(current_ts)?;
+            }
+            let window_ms = u64::try_from(self.options.schema_safe_window.as_millis())
+                .map_err(|_| Error::StringError("schema safe window overflow".into()))?;
+            request.max_commit_ts = current_ts
+                .checked_add(
+                    window_ms
+                        .checked_mul(1 << 18)
+                        .ok_or_else(|| Error::StringError("schema safe window overflow".into()))?,
+                )
+                .ok_or_else(|| Error::StringError("schema safe window overflow".into()))?;
+        }
 
         let builder = PlanBuilder::new(self.rpc.clone(), self.keyspace, request).resolve_lock(
             self.start_version.clone(),
@@ -1469,6 +1934,12 @@ impl<PdC: PdClient> Committer<PdC> {
         }
 
         self.options.try_one_pc = false;
+        // Any shard can reject async commit. A zero min_commit_ts is the
+        // protocol's fallback signal, never a timestamp to commit at.
+        if self.options.async_commit && response.iter().any(|response| response.min_commit_ts == 0)
+        {
+            self.options.async_commit = false;
+        }
 
         let min_commit_ts = response
             .iter()
@@ -1490,11 +1961,17 @@ impl<PdC: PdClient> Committer<PdC> {
         );
         let primary_key = self.primary_key.clone().into_iter();
         let commit_version = self.rpc.clone().get_timestamp().await?;
-        let req = new_commit_request(
+        if let Some(checker) = &self.options.schema_lease_checker {
+            checker.check(commit_version.version())?;
+        }
+        let mut req = new_commit_request(
             primary_key,
             self.start_version.clone(),
             commit_version.clone(),
         );
+        req.context
+            .get_or_insert_with(kvrpcpb::Context::default)
+            .disk_full_opt = self.options.disk_full_opt as i32;
         let plan = PlanBuilder::new(self.rpc.clone(), self.keyspace, req)
             .resolve_lock(
                 self.start_version.clone(),
@@ -1549,13 +2026,19 @@ impl<PdC: PdClient> Committer<PdC> {
                     Some(Error::KeyError(key_err)) => {
                         if let Some(expired) = key_err.commit_ts_expired {
                             // Ref: https://github.com/tikv/client-go/blob/tidb-8.5/txnkv/transaction/commit.go
-                            info!("2PC commit_ts rejected by TiKV, retry with a newer commit_ts, start_ts: {}",
-                                self.start_version.version());
+                            info!(
+                                "2PC commit_ts rejected by TiKV, retry with a newer commit_ts, start_ts: {}",
+                                self.start_version.version()
+                            );
 
                             let primary_key = self.primary_key.as_ref().unwrap();
                             if primary_key != expired.key.as_ref() {
-                                error!("2PC commit_ts rejected by TiKV, but the key is not the primary key, start_ts: {}, key: {}, primary: {}",
-                                    self.start_version.version(), format_key_for_log(&expired.key), format_key_for_log(primary_key));
+                                error!(
+                                    "2PC commit_ts rejected by TiKV, but the key is not the primary key, start_ts: {}, key: {}, primary: {}",
+                                    self.start_version.version(),
+                                    format_key_for_log(&expired.key),
+                                    format_key_for_log(primary_key)
+                                );
                                 return Err(Error::StringError("2PC commitTS rejected by TiKV, but the key is not the primary key".to_string()));
                             }
 
@@ -1566,8 +2049,10 @@ impl<PdC: PdClient> Committer<PdC> {
                                 .saturating_sub(expired.attempted_commit_ts)
                                 > 943718400000
                             {
-                                let msg = format!("2PC min_commit_ts is too large, we got min_commit_ts: {}, and attempted_commit_ts: {}",
-                                                     expired.min_commit_ts, expired.attempted_commit_ts);
+                                let msg = format!(
+                                    "2PC min_commit_ts is too large, we got min_commit_ts: {}, and attempted_commit_ts: {}",
+                                    expired.min_commit_ts, expired.attempted_commit_ts
+                                );
                                 return Err(Error::StringError(msg));
                             }
                             continue;
@@ -1622,7 +2107,7 @@ impl<PdC: PdClient> Committer<PdC> {
             fp()?
         });
 
-        let req = if self.options.async_commit {
+        let mut req = if self.options.async_commit {
             let keys = mutations.map(|m| m.key.into());
             new_commit_request(keys, start_version.clone(), commit_version)
         } else if primary_only {
@@ -1634,10 +2119,13 @@ impl<PdC: PdClient> Committer<PdC> {
                 .filter(|key| &primary_key != key);
             new_commit_request(keys, start_version.clone(), commit_version)
         };
+        req.context
+            .get_or_insert_with(kvrpcpb::Context::default)
+            .disk_full_opt = self.options.disk_full_opt as i32;
         let plan = PlanBuilder::new(self.rpc, self.keyspace, req)
             .resolve_lock(
                 start_version,
-                self.options.retry_options.lock_backoff,
+                self.options.retry_options.lock_backoff.clone(),
                 self.keyspace,
             )
             .retry_multi_region(self.options.retry_options.region_backoff)
@@ -1967,3 +2455,58 @@ mod tests {
         )));
     }
 }
+
+// TiKV signals lock-wait wakeups separately from terminal MVCC conflicts.
+fn is_pessimistic_retry(error: &Error) -> bool {
+    match error {
+        Error::KeyError(error) => error.conflict.as_ref().is_some_and(|conflict| {
+            conflict.reason == kvrpcpb::write_conflict::Reason::PessimisticRetry as i32
+        }),
+        Error::MultipleKeyErrors(errors) => {
+            !errors.is_empty() && errors.iter().all(is_pessimistic_retry)
+        }
+        Error::PessimisticLockError { inner, .. } => is_pessimistic_retry(inner),
+        _ => false,
+    }
+}
+
+fn should_retry_pessimistic_lock(wait_timeout_ms: i64, error: &Error) -> bool {
+    // The zero value uses the historical client-side retry policy. Explicit
+    // finite budgets are retried separately with an elapsed-time bound.
+    wait_timeout_ms == 0 && is_pessimistic_retry(error)
+}
+
+fn remaining_lock_wait_timeout_ms(wait_timeout_ms: i64, elapsed: Duration) -> i64 {
+    if wait_timeout_ms <= 0 {
+        return wait_timeout_ms;
+    }
+    let budget = Duration::from_millis(wait_timeout_ms as u64);
+    budget.saturating_sub(elapsed).as_millis().max(1) as i64
+}
+
+fn pessimistic_lock_resolve_backoff(wait_timeout_ms: i64, default: Backoff) -> Backoff {
+    if wait_timeout_ms == 0 {
+        default
+    } else {
+        Backoff::no_backoff()
+    }
+}
+
+fn shared_lock_conflict_info(error: &Error, start_ts: u64) -> (bool, bool) {
+    match error {
+        Error::ResolveLockError(locks) => (
+            contains_shared_locks(locks),
+            shared_locks_contain_transaction(locks, start_ts),
+        ),
+        Error::PessimisticLockError { inner, .. } => shared_lock_conflict_info(inner, start_ts),
+        _ => (false, false),
+    }
+}
+
+#[cfg(test)]
+#[path = "pessimistic_retry_test.rs"]
+mod pessimistic_retry_test;
+
+#[cfg(test)]
+#[path = "transaction_stage_test.rs"]
+mod transaction_stage_test;

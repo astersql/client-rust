@@ -1,3 +1,4 @@
+// Copyright 2026 AsterSQL.
 // Copyright 2019 TiKV Project Authors. Licensed under Apache-2.0.
 
 use std::collections::btree_map::Entry;
@@ -16,6 +17,7 @@ use crate::Value;
 use super::transaction::Mutation;
 
 /// A caching layer which buffers reads and writes in a transaction.
+#[derive(Clone)]
 pub struct Buffer {
     primary_key: Option<Key>,
     entry_map: BTreeMap<Key, BufferEntry>,
@@ -23,6 +25,9 @@ pub struct Buffer {
 }
 
 impl Buffer {
+    pub(crate) fn set_pessimistic(&mut self, enabled: bool) {
+        self.is_pessimistic = enabled;
+    }
     pub fn new(is_pessimistic: bool) -> Buffer {
         Buffer {
             primary_key: None,
@@ -71,11 +76,11 @@ impl Buffer {
     /// get the missing values.
     ///
     /// only used for snapshot read (i.e. not for `batch_get_for_update`)
-    pub async fn batch_get_or_else<F, Fut>(
+    pub async fn batch_get_or_else<F, Fut, I: Iterator<Item = Key>>(
         &mut self,
-        keys: impl Iterator<Item = Key>,
+        keys: I,
         f: F,
-    ) -> Result<impl Iterator<Item = KvPair>>
+    ) -> Result<impl Iterator<Item = KvPair> + use<F, Fut, I>>
     where
         F: FnOnce(Box<dyn Iterator<Item = Key> + Send>) -> Fut,
         Fut: Future<Output = Result<Vec<KvPair>>>,

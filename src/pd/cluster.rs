@@ -1,3 +1,4 @@
+// Copyright 2026 AsterSQL.
 // Copyright 2018 TiKV Project Authors. Licensed under Apache-2.0.
 
 use std::collections::HashSet;
@@ -43,6 +44,12 @@ macro_rules! pd_request {
 
 // These methods make a single attempt to make a request.
 impl Cluster {
+    pub async fn get_members(&mut self, timeout: Duration) -> Result<pdpb::GetMembersResponse> {
+        pd_request!(self.id, pdpb::GetMembersRequest)
+            .send(&mut self.client, timeout)
+            .await
+    }
+
     pub async fn get_region(
         &mut self,
         key: Vec<u8>,
@@ -230,6 +237,7 @@ impl Connection {
                 keyspacepb::keyspace_client::KeyspaceClient::<Channel>::new,
             )
             .await?;
+        crate::rpc_interceptor::before_pd("/pdpb.PD/GetMembers")?;
         let resp: pdpb::GetMembersResponse = client
             .get_members(pdpb::GetMembersRequest::default())
             .await?
@@ -352,10 +360,12 @@ type GrpcResult<T> = std::result::Result<T, tonic::Status>;
 trait PdMessage: Sized {
     type Client: Send;
     type Response: PdResponse;
+    const METHOD: &'static str;
 
     async fn rpc(req: Request<Self>, client: &mut Self::Client) -> GrpcResult<Self::Response>;
 
     async fn send(self, client: &mut Self::Client, timeout: Duration) -> Result<Self::Response> {
+        crate::rpc_interceptor::before_pd(Self::METHOD)?;
         let mut req = self.into_request();
         req.set_timeout(timeout);
         let response = Self::rpc(req, client).await?;
@@ -372,6 +382,7 @@ trait PdMessage: Sized {
 impl PdMessage for pdpb::GetRegionRequest {
     type Client = pdpb::pd_client::PdClient<Channel>;
     type Response = pdpb::GetRegionResponse;
+    const METHOD: &'static str = "/pdpb.PD/GetRegion";
 
     async fn rpc(req: Request<Self>, client: &mut Self::Client) -> GrpcResult<Self::Response> {
         Ok(client.get_region(req).await?.into_inner())
@@ -382,6 +393,7 @@ impl PdMessage for pdpb::GetRegionRequest {
 impl PdMessage for pdpb::GetRegionByIdRequest {
     type Client = pdpb::pd_client::PdClient<Channel>;
     type Response = pdpb::GetRegionResponse;
+    const METHOD: &'static str = "/pdpb.PD/GetRegionByID";
 
     async fn rpc(req: Request<Self>, client: &mut Self::Client) -> GrpcResult<Self::Response> {
         Ok(client.get_region_by_id(req).await?.into_inner())
@@ -392,6 +404,7 @@ impl PdMessage for pdpb::GetRegionByIdRequest {
 impl PdMessage for pdpb::GetStoreRequest {
     type Client = pdpb::pd_client::PdClient<Channel>;
     type Response = pdpb::GetStoreResponse;
+    const METHOD: &'static str = "/pdpb.PD/GetStore";
 
     async fn rpc(req: Request<Self>, client: &mut Self::Client) -> GrpcResult<Self::Response> {
         Ok(client.get_store(req).await?.into_inner())
@@ -402,6 +415,7 @@ impl PdMessage for pdpb::GetStoreRequest {
 impl PdMessage for pdpb::GetAllStoresRequest {
     type Client = pdpb::pd_client::PdClient<Channel>;
     type Response = pdpb::GetAllStoresResponse;
+    const METHOD: &'static str = "/pdpb.PD/GetAllStores";
 
     async fn rpc(req: Request<Self>, client: &mut Self::Client) -> GrpcResult<Self::Response> {
         Ok(client.get_all_stores(req).await?.into_inner())
@@ -412,6 +426,7 @@ impl PdMessage for pdpb::GetAllStoresRequest {
 impl PdMessage for pdpb::UpdateGcSafePointRequest {
     type Client = pdpb::pd_client::PdClient<Channel>;
     type Response = pdpb::UpdateGcSafePointResponse;
+    const METHOD: &'static str = "/pdpb.PD/UpdateGCSafePoint";
 
     async fn rpc(req: Request<Self>, client: &mut Self::Client) -> GrpcResult<Self::Response> {
         Ok(client.update_gc_safe_point(req).await?.into_inner())
@@ -422,6 +437,7 @@ impl PdMessage for pdpb::UpdateGcSafePointRequest {
 impl PdMessage for keyspacepb::LoadKeyspaceRequest {
     type Client = keyspacepb::keyspace_client::KeyspaceClient<Channel>;
     type Response = keyspacepb::LoadKeyspaceResponse;
+    const METHOD: &'static str = "/keyspacepb.Keyspace/LoadKeyspace";
 
     async fn rpc(req: Request<Self>, client: &mut Self::Client) -> GrpcResult<Self::Response> {
         Ok(client.load_keyspace(req).await?.into_inner())
@@ -457,6 +473,21 @@ impl PdResponse for pdpb::UpdateGcSafePointResponse {
 }
 
 impl PdResponse for keyspacepb::LoadKeyspaceResponse {
+    fn header(&self) -> &pdpb::ResponseHeader {
+        self.header.as_ref().unwrap()
+    }
+}
+
+#[async_trait]
+impl PdMessage for pdpb::GetMembersRequest {
+    type Client = pdpb::pd_client::PdClient<Channel>;
+    type Response = pdpb::GetMembersResponse;
+    const METHOD: &'static str = "/pdpb.PD/GetMembers";
+    async fn rpc(req: Request<Self>, client: &mut Self::Client) -> GrpcResult<Self::Response> {
+        Ok(client.get_members(req).await?.into_inner())
+    }
+}
+impl PdResponse for pdpb::GetMembersResponse {
     fn header(&self) -> &pdpb::ResponseHeader {
         self.header.as_ref().unwrap()
     }

@@ -1,3 +1,4 @@
+// Copyright 2026 AsterSQL.
 // Copyright 2019 TiKV Project Authors. Licensed under Apache-2.0.
 
 use std::sync::Arc;
@@ -379,6 +380,17 @@ impl Client {
             .merge(crate::request::Collect)
             .plan();
         plan.execute().await
+    }
+
+    /// Fetch actual lock wait entries from all live TiKV stores.
+    pub async fn get_lock_waits(&self) -> Result<Vec<crate::proto::deadlock::WaitForEntry>> {
+        let request = crate::proto::kvrpcpb::GetLockWaitInfoRequest::default();
+        crate::request::PlanBuilder::new(self.pd.clone(), self.keyspace, request)
+            .all_stores(DEFAULT_STORE_BACKOFF)
+            .merge(crate::request::Collect)
+            .plan()
+            .execute()
+            .await
     }
 
     fn new_transaction(&self, timestamp: Timestamp, options: TransactionOptions) -> Transaction {
