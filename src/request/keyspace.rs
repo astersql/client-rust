@@ -41,6 +41,13 @@ impl Keyspace {
             Keyspace::ApiV2NoPrefix => kvrpcpb::ApiVersion::V2,
         }
     }
+
+    pub fn id(&self) -> Option<u32> {
+        match self {
+            Keyspace::Enable { keyspace_id } => Some(*keyspace_id),
+            Keyspace::Disable | Keyspace::ApiV2NoPrefix => None,
+        }
+    }
 }
 
 pub trait EncodeKeyspace {
@@ -291,6 +298,14 @@ fn pretruncate_bytes<const N: usize>(vec: &mut Vec<u8>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn keyspace_id_is_exposed_only_for_named_api_v2_keyspaces() {
+        assert_eq!(Keyspace::Disable.id(), None);
+        assert_eq!(Keyspace::ApiV2NoPrefix.id(), None);
+        assert_eq!(Keyspace::Enable { keyspace_id: 42 }.id(), Some(42));
+        assert_eq!(Keyspace::Enable { keyspace_id: 0 }.id(), Some(0));
+    }
 
     #[test]
     fn test_keyspace_prefix() {

@@ -70,6 +70,14 @@ impl Clone for Client {
 }
 
 impl Client {
+    /// Returns the numeric ID resolved for a named API-v2 keyspace.
+    ///
+    /// API-v1 and API-v2-no-prefix clients do not belong to a named keyspace
+    /// and therefore return `None`.
+    pub fn keyspace_id(&self) -> Option<u32> {
+        self.keyspace.id()
+    }
+
     /// Create a transactional [`Client`] and connect to the TiKV cluster.
     ///
     /// Because TiKV is managed by a [PD](https://github.com/pingcap/pd/) cluster, the endpoints for
